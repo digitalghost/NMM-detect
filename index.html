@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#060b13" />
+    <title>NMM 光影预演室</title>
+    <link rel="stylesheet" href="styles.css?v=20260920-10" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand-mark">N</div>
+        <div>
+          <p class="eyebrow">NON-METALLIC METAL STUDY</p>
+          <h1>NMM 光影预演室</h1>
+        </div>
+        <div class="status"><span></span> 本地算法运行</div>
+      </header>
+
+      <section class="workspace">
+        <aside class="panel controls">
+          <div class="step-block">
+            <div class="step-title"><span>照片与分析</span></div>
+            <label class="upload-button" for="imageInput">
+              <span>＋</span> 导入模型照片
+            </label>
+            <input id="imageInput" type="file" accept="image/*" hidden />
+            <p id="aiStatus" class="ai-status" aria-live="polite">最高精度 1008 px · 完全本地运行</p>
+            <div class="capture-tip">
+              <i aria-hidden="true"></i>
+              <p><b>细节识别推荐</b><span>使用 40–60% 中性哑光灰补土，并从侧上方柔和打光。避免纯黑、纯白、亮面和金属色补土。</span></p>
+            </div>
+            <button id="demoButton" class="text-button">载入演示图</button>
+          </div>
+
+          <div class="correction-block">
+            <div class="correction-heading"><b>主体补充识别</b><span>识别不完整时使用</span></div>
+            <button id="regionSelectButton" class="secondary-button region-button">补充识别区域</button>
+            <button id="clearRegionsButton" class="text-button region-clear" disabled>清除补选框</button>
+            <p id="regionHint" class="hint">在漏识别部位拖出矩形，AI 会将结果并入主体。</p>
+          </div>
+        </aside>
+
+        <section class="stage-wrap">
+          <div class="canvas-frame" id="canvasFrame">
+            <canvas id="mainCanvas"></canvas>
+            <div class="light-handle" id="stageLight" title="拖动改变灯光方向">☀</div>
+            <div class="canvas-meta">
+              <div class="canvas-badge">LIVE PREVIEW</div>
+              <strong id="photoName">NMM 演示 · 圆盾</strong>
+              <span id="canvasInfo">拖动太阳调整光照方向</span>
+            </div>
+            <div class="zoom-level-badge" id="zoomLevelBadge" hidden>ZOOM 1 · 1008 px</div>
+            <div class="compare-tools" aria-label="预览对比工具">
+              <button id="originalToggle" type="button" disabled aria-pressed="false" title="单击固定原图，按住临时查看原图"><b>◐</b><span>原图</span></button>
+              <button id="compareToggle" type="button" disabled aria-pressed="false" title="拖动分隔线对比原图与光影"><b>↔</b><span>对比</span></button>
+              <button id="lightingToggle" type="button" disabled aria-pressed="true" title="显示完整 NMM 光影"><b>☀</b><span>光影</span></button>
+            </div>
+            <div id="compareDivider" class="compare-divider" role="separator" aria-label="原图与光影分隔线" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" tabindex="0" hidden><span>↔</span></div>
+            <div class="zoom-control" id="zoomControl" aria-label="画面缩放">
+              <button id="zoomInButton" type="button" aria-label="放大">＋</button>
+              <input id="zoomRange" type="range" min="100" max="300" step="25" value="100" aria-label="缩放比例" disabled />
+              <output id="zoomValue" for="zoomRange">1×</output>
+              <button id="zoomOutButton" type="button" aria-label="缩小" disabled>−</button>
+            </div>
+            <div class="empty-state" id="emptyState" hidden>
+              <strong>把模型照片放到这里</strong>
+              <span>支持 JPG、PNG 和 WebP</span>
+            </div>
+          </div>
+          <div class="reflection-legend">
+            <div class="primary-scale">
+              <strong>主反射 · 色阶</strong>
+              <span id="primaryLegendSwatches"></span>
+              <small>暗 → 亮</small>
+            </div>
+            <div class="reflection-key"><i class="reflection-chip secondary-chip"></i><span><b>二次反射</b>材质冷调</span></div>
+            <div class="reflection-key"><i class="reflection-chip tertiary-chip"></i><span><b>三次反射</b>材质暖调</span></div>
+            <div class="reflection-key"><i class="line-edge"></i><span><b>结构线</b>黑色</span></div>
+          </div>
+        </section>
+
+        <aside class="panel lighting">
+          <div class="step-title"><span>NMM 效果</span></div>
+          <div class="auto-light-card">
+            <i>✦</i>
+            <span><b>智能艺术布光</b><small>自动平衡主光、补光和细节光</small></span>
+          </div>
+          <p class="hint direct-light-hint">需要改变受光方向时，直接拖动画面中的太阳。</p>
+
+          <label class="slider-row wide">
+            <span>光影强度</span><output id="strengthValue">72%</output>
+            <input id="strength" type="range" min="10" max="100" value="72" />
+          </label>
+
+          <label class="slider-row wide">
+            <span>金属光滑度</span><output id="glossValue">半光 68%</output>
+            <input id="gloss" type="range" min="0" max="100" value="68" aria-label="金属光滑度，0 为粗糙，100 为镜面" />
+          </label>
+
+          <label class="slider-row wide">
+            <span>光影平滑</span><output id="normalSmoothValue">4 px</output>
+            <input id="normalSmooth" type="range" min="0" max="24" value="4" />
+          </label>
+
+          <p class="control-label palette-label">材质</p>
+          <div class="material-picker" id="materialPicker">
+            <button class="active" data-material="silver" title="白银"><i></i><span>白银</span></button>
+            <button data-material="stainless" title="不锈钢"><i></i><span>不锈钢</span></button>
+            <button data-material="aluminum" title="铝"><i></i><span>铝</span></button>
+            <button data-material="gold" title="黄金"><i></i><span>黄金</span></button>
+            <button data-material="copper" title="红铜"><i></i><span>红铜</span></button>
+            <button data-material="bronze" title="青铜"><i></i><span>青铜</span></button>
+            <button data-material="darksteel" title="黑钢"><i></i><span>黑钢</span></button>
+          </div>
+
+          <p class="control-label tint-label">光谱色调</p>
+          <div class="tint-picker" id="tintPicker">
+            <button class="active natural" data-tint="natural" title="材质原色"><span>原</span></button>
+            <button class="red" data-tint="red" title="红色"></button>
+            <button class="yellow" data-tint="yellow" title="黄色"></button>
+            <button class="green" data-tint="green" title="绿色"></button>
+            <button class="blue" data-tint="blue" title="蓝色"></button>
+            <button class="purple" data-tint="purple" title="紫色"></button>
+            <button class="black" data-tint="black" title="黑色"></button>
+          </div>
+          <p class="material-combo"><b id="materialComboName">白银 · 原色</b><span>共 49 种材质与色调组合</span></p>
+
+          <details class="compact-details advanced-details">
+            <summary>高级设置 <span>使用推荐值即可，必要时再调整</span></summary>
+            <div class="details-body">
+              <p class="control-label advanced-label">艺术布光</p>
+              <div class="segmented lighting-presets" id="lightingPresets">
+                <button data-lighting="single">主光</button>
+                <button class="active" data-lighting="balanced">均衡</button>
+                <button data-lighting="detail">细节</button>
+              </div>
+              <label class="slider-row wide">
+                <span>自动补光</span><output id="fillLightValue">28%</output>
+                <input id="fillLight" type="range" min="0" max="70" value="28" />
+              </label>
+              <label class="slider-row wide detail-control">
+                <span>细节光</span><output id="detailLightValue">35%</output>
+                <input id="detailLight" type="range" min="0" max="100" value="35" disabled />
+              </label>
+              <label class="slider-row wide detail-control">
+                <span>细节尺度</span><output id="detailScaleValue">4 px</output>
+                <input id="detailScale" type="range" min="1" max="12" value="4" disabled />
+              </label>
+              <label class="slider-row wide detail-control">
+                <span>微结构光照</span><output id="detailStrengthValue">28%</output>
+                <input id="detailStrength" type="range" min="0" max="100" value="28" disabled />
+              </label>
+              <label class="slider-row wide">
+                <span>反射层次</span><output id="reflectionsValue">3 层</output>
+                <input id="reflections" type="range" min="1" max="3" value="3" />
+              </label>
+              <label class="slider-row wide">
+                <span>环境反光</span><output id="bounceValue">38%</output>
+                <input id="bounce" type="range" min="0" max="80" value="38" />
+              </label>
+              <label class="slider-row wide">
+                <span>色阶数量</span><output id="stepsValue">7 阶</output>
+                <input id="steps" type="range" min="3" max="9" value="7" />
+              </label>
+            </div>
+          </details>
+
+          <p id="tipText" class="compact-tip">默认值已经平衡；需要特殊画面效果时再展开高级设置。</p>
+          <div id="exportControl" class="export-control">
+            <button id="downloadButton" class="primary-button" aria-haspopup="menu" aria-expanded="false">导出 <span>↗</span></button>
+            <div id="exportMenu" class="export-menu" role="menu" hidden>
+              <button type="button" role="menuitem" data-export="comparison">
+                <b>高清对照 PNG</b><span>原图、照片上色与纯指引</span>
+              </button>
+          <button type="button" role="menuitem" data-export="mp4">
+            <b>微信对比视频 MP4</b><span>擦拭切换原图与光影，聊天中可预览</span>
+              </button>
+              <button type="button" role="menuitem" data-export="current">
+                <b>仅导出当前画面</b><span>保持现在看到的显示状态</span>
+              </button>
+            </div>
+            <p id="exportStatus" class="export-status" aria-live="polite"></p>
+          </div>
+        </aside>
+      </section>
+    </main>
+  <script src="app.js?v=20260920-12"></script>
+  </body>
+</html>

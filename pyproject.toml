@@ -1,0 +1,32 @@
+[project]
+name = "nmm-sim"
+version = "0.2.0"
+description = "Local miniature segmentation, geometry estimation, and NMM lighting preview"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi",
+  "addict",
+  "e3nn",
+  "einops",
+  "evo",
+  "imageio",
+  "matplotlib",
+  "modelscope",
+  "moviepy==1.0.3",
+  "numpy",
+  "omegaconf",
+  "opencv-python-headless",
+  "pillow",
+  "pillow-heif",
+  "plyfile",
+  "pycolmap",
+  "python-multipart",
+  "scipy",
+  "torch",
+  "torchvision",
+  "transformers",
+  "uvicorn",
+]
+
+[tool.uv]
+package = false
