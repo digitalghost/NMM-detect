@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#060b13" />
     <title>NMM 光影预演室</title>
-    <link rel="stylesheet" href="styles.css?v=20260920-10" />
+    <link rel="stylesheet" href="styles.css?v=20260920-11" />
   </head>
   <body>
     <main class="app-shell">
@@ -130,6 +130,13 @@
           <details class="compact-details advanced-details">
             <summary>高级设置 <span>使用推荐值即可，必要时再调整</span></summary>
             <div class="details-body">
+              <p class="control-label advanced-label">NMM 艺术塑形</p>
+              <div class="segmented art-direction-presets" id="artDirectionPresets">
+                <button data-art-direction="original" title="关闭新算法，使用 v0.2.0 原始光照">原始</button>
+                <button class="active" data-art-direction="balanced" title="连续反射带与适度艺术对比">平衡</button>
+                <button data-art-direction="competition" title="更强的黑白邻接与视觉焦点">竞赛</button>
+              </div>
+              <p id="surfaceStatus" class="surface-status">完成形体分析后，将自动建立表面分区。</p>
               <p class="control-label advanced-label">艺术布光</p>
               <div class="segmented lighting-presets" id="lightingPresets">
                 <button data-lighting="single">主光</button>
@@ -186,6 +193,6 @@
         </aside>
       </section>
     </main>
-  <script src="app.js?v=20260920-12"></script>
+  <script src="app.js?v=20260920-13"></script>
   </body>
 </html>

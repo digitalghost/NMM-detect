@@ -36,6 +36,7 @@ const state = {
   material: 'silver', tint: 'natural', showOriginal: true, lightingEnabled: true, previewMode: 'lighting',
   gloss: 68, normalSmooth: 4, strength: .72, reflections: 3, bounce: .38, steps: 7,
   detailScale: 4, detailStrength: .28,
+  artDirection: 'balanced',
   lightPreset: 'balanced', fillLight: .28, detailLight: .35,
   lightX: -.38, lightY: -.42, lightDragging: false,
   hasImage: true, maskDirty: true, regionSelecting: false, inferenceBusy: false
@@ -77,6 +78,11 @@ const LIGHTING_PRESETS = {
   balanced: {fillLight:.28, detailLight:.35},
   detail: {fillLight:.16, detailLight:.68}
 };
+const ART_DIRECTION_PRESETS = {
+  original: {name:'原始', band:0, contrast:0, separation:0},
+  balanced: {name:'平衡', band:.58, contrast:.48, separation:.42},
+  competition: {name:'竞赛', band:.88, contrast:.78, separation:.7}
+};
 let maskData = null;
 let cachedBox = null;
 let aiNormalData = null;
@@ -92,6 +98,7 @@ let currentAnalysisId = null;
 let pendingLocalRegion = null;
 let detailNormalData = null;
 let detailNormalReady = false;
+let surfaceAnalysis = null;
 let exportBusy = false;
 let comparisonPosition = .5;
 let lensActive = false;
@@ -135,6 +142,7 @@ function syncInferenceControls() {
   document.querySelector('#detailScale').disabled=busy||!detailNormalReady;
   document.querySelector('#detailStrength').disabled=busy||!detailNormalReady;
   document.querySelectorAll('#lightingPresets button').forEach(button=>{button.disabled=busy;});
+  document.querySelectorAll('#artDirectionPresets button').forEach(button=>{button.disabled=busy;});
   const canZoom=!busy&&Boolean(currentAnalysisId);
   const zoomRange=document.querySelector('#zoomRange');
   zoomRange.disabled=!canZoom;
@@ -450,6 +458,7 @@ function sizeCanvases(w, h) {
   aiLineartReady = false;
   detailNormalData = null;
   detailNormalReady = false;
+  surfaceAnalysis = null;
   depthPreviewReady = false;
 }
 
@@ -511,6 +520,7 @@ function createDemo() {
 
 function getMaskInfo() {
   if (!state.maskDirty && maskData && cachedBox) return { data: maskData, box: cachedBox };
+  surfaceAnalysis=null;
   maskData = maskCtx.getImageData(0,0,canvas.width,canvas.height).data;
   let minX=canvas.width,minY=canvas.height,maxX=0,maxY=0,count=0;
   for(let y=0;y<canvas.height;y+=2) for(let x=0;x<canvas.width;x+=2) {
@@ -536,6 +546,122 @@ function normalAt(x,y,includeDetail=true) {
     const mixedLength=Math.hypot(nx,ny,nz)||1;nx/=mixedLength;ny/=mixedLength;nz/=mixedLength;
   }
   return [nx,ny,nz];
+}
+
+function updateSurfaceStatus(analysis){
+  const status=document.querySelector('#surfaceStatus');
+  if(!status)return;
+  if(state.artDirection==='original'){
+    status.textContent='艺术塑形已关闭，使用 v0.2.0 原始光照。';
+    return;
+  }
+  if(!analysis){
+    status.textContent='完成形体分析后，将自动建立表面分区。';
+    return;
+  }
+  const {plane=0,cylinder=0,rounded=0,bevel=0,detail=0}=analysis.summary;
+  status.textContent=`自动分区 ${analysis.patches.length} 块 · 平面 ${plane} · 柱面 ${cylinder} · 曲面 ${rounded} · 棱边/细节 ${bevel+detail}`;
+}
+
+function buildSurfaceAnalysis(){
+  if(surfaceAnalysis)return surfaceAnalysis;
+  if(!aiNormalData||!aiLineartReady||!canvas.width||!canvas.height)return null;
+  const {data:mask,box}=getMaskInfo();
+  if(!box)return null;
+  const width=canvas.width,height=canvas.height;
+  const step=Math.max(4,Math.round(Math.max(width,height)/210));
+  const gridWidth=Math.ceil(width/step),gridHeight=Math.ceil(height/step);
+  const cellCount=gridWidth*gridHeight;
+  const valid=new Uint8Array(cellCount);
+  const cellNX=new Float32Array(cellCount),cellNY=new Float32Array(cellCount),cellNZ=new Float32Array(cellCount);
+  const cellDepth=new Float32Array(cellCount);
+  const labels=new Int32Array(cellCount);labels.fill(-1);
+  const lineData=lineartCtx.getImageData(0,0,width,height).data;
+  const depthData=depthMapCtx.getImageData(0,0,width,height).data;
+  let totalCells=0;
+
+  for(let gy=0;gy<gridHeight;gy++){
+    const y=Math.min(height-1,gy*step+Math.floor(step/2));
+    for(let gx=0;gx<gridWidth;gx++){
+      const x=Math.min(width-1,gx*step+Math.floor(step/2));
+      const index=gy*gridWidth+gx,p=(y*width+x)*4;
+      if(mask[p+3]<32)continue;
+      let nx=aiNormalData[p]/127.5-1,ny=aiNormalData[p+1]/127.5-1,nz=aiNormalData[p+2]/127.5-1;
+      const length=Math.hypot(nx,ny,nz)||1;nx/=length;ny/=length;nz/=length;
+      const lineLuma=(lineData[p]+lineData[p+1]+lineData[p+2])/(3*255);
+      const ink=1-lineLuma;
+      // Near-black structure lines act as watershed boundaries. They keep two
+      // neighbouring armour plates from becoming one giant transitive patch.
+      if(ink>.64)continue;
+      valid[index]=1;cellNX[index]=nx;cellNY[index]=ny;cellNZ[index]=nz;
+      cellDepth[index]=(depthData[p]+depthData[p+1]+depthData[p+2])/(3*255);
+      totalCells++;
+    }
+  }
+
+  const queue=new Int32Array(cellCount);
+  const patches=[];
+  const neighbours=[[-1,0],[1,0],[0,-1],[0,1]];
+  for(let seed=0;seed<cellCount;seed++){
+    if(!valid[seed]||labels[seed]!==-1)continue;
+    const patchId=patches.length;
+    const seedNX=cellNX[seed],seedNY=cellNY[seed],seedNZ=cellNZ[seed],seedDepth=cellDepth[seed];
+    let head=0,tail=0;queue[tail++]=seed;labels[seed]=patchId;
+    let count=0,sumNX=0,sumNY=0,sumNZ=0,sumNXX=0,sumNYY=0,sumNXY=0,sumX=0,sumY=0;
+    while(head<tail){
+      const current=queue[head++],cy=Math.floor(current/gridWidth),cx=current-cy*gridWidth;
+      const nx=cellNX[current],ny=cellNY[current],nz=cellNZ[current];
+      count++;sumNX+=nx;sumNY+=ny;sumNZ+=nz;sumNXX+=nx*nx;sumNYY+=ny*ny;sumNXY+=nx*ny;
+      sumX+=Math.min(width-1,cx*step+step*.5);sumY+=Math.min(height-1,cy*step+step*.5);
+      for(const [ox,oy] of neighbours){
+        const nextX=cx+ox,nextY=cy+oy;
+        if(nextX<0||nextY<0||nextX>=gridWidth||nextY>=gridHeight)continue;
+        const next=nextY*gridWidth+nextX;
+        if(!valid[next]||labels[next]!==-1)continue;
+        const localDot=nx*cellNX[next]+ny*cellNY[next]+nz*cellNZ[next];
+        const seedDot=seedNX*cellNX[next]+seedNY*cellNY[next]+seedNZ*cellNZ[next];
+        const localDepth=Math.abs(cellDepth[current]-cellDepth[next]);
+        const seedDepthDelta=Math.abs(seedDepth-cellDepth[next]);
+        if(localDot<.94||seedDot<.76||localDepth>.11||seedDepthDelta>.25)continue;
+        labels[next]=patchId;queue[tail++]=next;
+      }
+    }
+    const meanNX=sumNX/count,meanNY=sumNY/count,meanNZ=sumNZ/count;
+    const covarianceXX=Math.max(0,sumNXX/count-meanNX*meanNX);
+    const covarianceYY=Math.max(0,sumNYY/count-meanNY*meanNY);
+    const covarianceXY=sumNXY/count-meanNX*meanNY;
+    const trace=covarianceXX+covarianceYY;
+    const discriminant=Math.sqrt(Math.max(0,(covarianceXX-covarianceYY)**2+4*covarianceXY**2));
+    const eigen1=(trace+discriminant)/2,eigen2=Math.max(0,(trace-discriminant)/2);
+    const spread=Math.max(0,1-Math.hypot(sumNX,sumNY,sumNZ)/count);
+    let kind='rounded';
+    if(count<=3)kind='detail';
+    else if(meanNZ<.38)kind='bevel';
+    else if(spread<.018)kind='plane';
+    else if(eigen1>1e-4&&eigen2/eigen1<.32)kind='cylinder';
+    patches.push({
+      id:patchId,count,cx:sumX/count,cy:sumY/count,
+      meanNX,meanNY,meanNZ,spread,eigen1,eigen2,kind,
+      importance:.5,reliability:Math.max(0,Math.min(1,(count-2)/20)),
+      horizonOffset:0,bandWidth:.14
+    });
+  }
+
+  const summary={plane:0,cylinder:0,rounded:0,bevel:0,detail:0};
+  for(const patch of patches){
+    summary[patch.kind]=(summary[patch.kind]||0)+1;
+    const normalizedX=(patch.cx-box.cx)/Math.max(1,box.rx);
+    const normalizedY=(patch.cy-box.cy)/Math.max(1,box.ry);
+    const centrality=1-Math.min(1,Math.hypot(normalizedX,normalizedY)/1.15);
+    const sizeScore=Math.min(1,Math.sqrt(patch.count/Math.max(1,totalCells*.045)));
+    const upperScore=1-Math.max(0,Math.min(1,(patch.cy-box.minY)/Math.max(1,box.maxY-box.minY)));
+    patch.importance=Math.max(.12,Math.min(1,.18+centrality*.34+sizeScore*.3+upperScore*.18));
+    patch.horizonOffset=Math.max(-.085,Math.min(.085,(patch.cy/height-.48)*.055+patch.meanNX*.025));
+    patch.bandWidth=patch.kind==='plane'?.23:patch.kind==='cylinder'?.1:patch.kind==='bevel'?.075:patch.kind==='detail'?.085:.145;
+  }
+  surfaceAnalysis={step,gridWidth,gridHeight,labels,patches,summary};
+  updateSurfaceStatus(surfaceAnalysis);
+  return surfaceAnalysis;
 }
 
 function renderLightingFrame(drawOverlay=true) {
@@ -587,7 +713,11 @@ function renderLightingFrame(drawOverlay=true) {
   const specularGain=.28+(.96-.28)*smoothness;
   const rimGain=.12+(.25-.12)*smoothness;
   const reflectionGain=.58+(1.12-.58)*smoothness;
+  const artProfile=ART_DIRECTION_PRESETS[state.artDirection]||ART_DIRECTION_PRESETS.original;
+  const surfaces=artProfile.band>0?buildSurfaceAnalysis():null;
+  if(!surfaces)updateSurfaceStatus(null);
   for(let y=Math.max(0,box.minY-3);y<=Math.min(canvas.height-1,box.maxY+3);y++){
+    const surfaceRow=surfaces?Math.min(surfaces.gridHeight-1,Math.floor(y/surfaces.step))*surfaces.gridWidth:0;
     for(let x=Math.max(0,box.minX-3);x<=Math.min(canvas.width-1,box.maxX+3);x++){
       const p=(y*canvas.width+x)*4, a=mask[p+3]/255;
       if(a<.03) continue;
@@ -613,11 +743,46 @@ function renderLightingFrame(drawOverlay=true) {
         const microLight=Math.max(0,detailDiffuse-macroDiffuse)*.55+Math.max(0,detailSpec-macroSpec)*.35;
         primary+=microLight*state.detailLight;
       }
+      let environmentCool=0,environmentWarm=0;
+      if(surfaces){
+        const cellX=Math.min(surfaces.gridWidth-1,Math.floor(x/surfaces.step));
+        const patchId=surfaces.labels[surfaceRow+cellX];
+        const patch=patchId>=0?surfaces.patches[patchId]:null;
+        if(patch){
+          // Reflect the viewing direction around the broad surface normal. A
+          // bright horizon stripe with dark shoulders approximates the large
+          // sky/ground reflection that painters commonly encode in NMM.
+          const reflectedX=2*mnz*mnx,reflectedY=2*mnz*mny;
+          const environmentCoord=reflectedY*.92+reflectedX*.18*(lx>=0?1:-1)-patch.horizonOffset;
+          const bandWidth=Math.max(.045,patch.bandWidth*(1.24-smoothness*.5));
+          const brightBand=Math.exp(-.5*(environmentCoord/bandWidth)**2);
+          const shoulderDistance=Math.abs(environmentCoord)-bandWidth*2.05;
+          const darkShoulder=Math.exp(-.5*(shoulderDistance/Math.max(.035,bandWidth*.72))**2);
+          const coherence=.08+.92*patch.reliability;
+          const priority=.68+.42*patch.importance;
+          primary+=brightBand*artProfile.band*(.18+.22*smoothness)*priority*coherence;
+          primary-=darkShoulder*artProfile.contrast*(.085+.09*smoothness)*coherence;
+
+          // Allocate slightly more contrast to large, central and upper
+          // patches, while suppressing tiny low-confidence islands. This is a
+          // deterministic art-direction score, not another AI inference.
+          const pivot=.46-(patch.importance-.5)*.035;
+          const contrastGain=1+artProfile.contrast*(.16+.2*patch.importance)*coherence;
+          primary=pivot+(primary-pivot)*contrastGain;
+          primary+=(patch.importance-.5)*artProfile.separation*.055*coherence;
+
+          const sky=Math.max(0,Math.min(1,.5-environmentCoord*.88));
+          const ground=1-sky;
+          environmentCool=sky*(.045+.105*brightBand)*artProfile.band*state.bounce*coherence;
+          environmentWarm=ground*(.035+.085*brightBand)*artProfile.band*state.bounce*coherence;
+        }
+      }
       primary=Math.max(0,Math.min(.999,primary));
       const q=Math.round(primary*(state.steps-1))/(state.steps-1);
       const pos=q*(pal.length-1), lo=Math.floor(pos), hi=Math.min(pal.length-1,lo+1), f=pos-lo;
       let r=pal[lo][0]*(1-f)+pal[hi][0]*f, g=pal[lo][1]*(1-f)+pal[hi][1]*f, b=pal[lo][2]*(1-f)+pal[hi][2]*f;
-      const secondaryGuide=secondary*state.bounce,tertiaryGuide=tertiary*state.bounce;
+      const secondaryGuide=secondary*state.bounce+(state.reflections>=2?environmentCool:0);
+      const tertiaryGuide=tertiary*state.bounce+(state.reflections>=3?environmentWarm:0);
       // Reflections keep the selected metal underneath instead of replacing it
       // with two fixed annotation colours. The cool/warm shifts are derived
       // from the current shade, which avoids cyan clashing with blue metals or
@@ -1128,6 +1293,15 @@ function applyLightingPreset(name){
 }
 document.querySelectorAll('#lightingPresets button').forEach(button=>button.addEventListener('click',()=>applyLightingPreset(button.dataset.lighting)));
 
+function applyArtDirection(name){
+  if(!ART_DIRECTION_PRESETS[name])return;
+  state.artDirection=name;
+  document.querySelectorAll('#artDirectionPresets button').forEach(button=>button.classList.toggle('active',button.dataset.artDirection===name));
+  updateSurfaceStatus(surfaceAnalysis);
+  render();
+}
+document.querySelectorAll('#artDirectionPresets button').forEach(button=>button.addEventListener('click',()=>applyArtDirection(button.dataset.artDirection)));
+
 function updatePrimaryLegend(){
   const palette=getActivePalette();
   const colors=Array.from({length:state.steps},(_,index)=>{
@@ -1204,6 +1378,7 @@ function rebuildAINormals(renderAfter=true){
   normalFilteredCtx.drawImage(normalSourceCanvas,0,0);
   normalFilteredCtx.restore();
   aiNormalData=normalFilteredCtx.getImageData(0,0,normalFilteredCanvas.width,normalFilteredCanvas.height).data;
+  surfaceAnalysis=null;
   if(renderAfter)render();
 }
 
