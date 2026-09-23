@@ -1,13 +1,67 @@
 // Keep every local tab on one origin so browser-wide inference locks also work
 // when the app was opened once with 127.0.0.1 and once with localhost.
-if (window.location.hostname === '127.0.0.1') {
+if (!window.AndroidNMM && window.location.hostname === '127.0.0.1') {
   const canonicalUrl = new URL(window.location.href);
   canonicalUrl.hostname = 'localhost';
   window.location.replace(canonicalUrl);
 }
 
+const isAndroidApp = Boolean(window.AndroidNMM);
+const androidPending = new Map();
+let androidRequestSequence = 0;
+
+if (isAndroidApp) {
+  document.documentElement.classList.add('android-app');
+  const mobileStyles = document.createElement('link');
+  mobileStyles.rel = 'stylesheet';
+  mobileStyles.href = 'android.css';
+  document.head.appendChild(mobileStyles);
+}
+
+window.__androidNMMCallback = (requestId, succeeded, payloadText) => {
+  const pending = androidPending.get(requestId);
+  if (!pending) return;
+  androidPending.delete(requestId);
+  let payload;
+  try { payload = payloadText ? JSON.parse(payloadText) : {}; }
+  catch { payload = {detail: payloadText || 'Android 返回了无法解析的数据'}; }
+  if (succeeded) pending.resolve(payload);
+  else pending.reject(new Error(payload.detail || 'Android 本地操作失败'));
+};
+
+window.__androidNMMProgress = message => {
+  const status = document.querySelector('#aiStatus');
+  if (!status) return;
+  status.className = 'ai-status busy';
+  status.textContent = message;
+};
+
+function invokeAndroid(method, ...args) {
+  return new Promise((resolve, reject) => {
+    const requestId = `android-${Date.now()}-${++androidRequestSequence}`;
+    androidPending.set(requestId, {resolve, reject});
+    try { window.AndroidNMM[method](requestId, ...args); }
+    catch (error) { androidPending.delete(requestId); reject(error); }
+  });
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('无法读取图片数据'));
+    reader.readAsDataURL(blob);
+  });
+}
+
 const canvas = document.querySelector('#mainCanvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const pinchViewportOverlay = isAndroidApp ? document.createElement('div') : null;
+if(pinchViewportOverlay){
+  pinchViewportOverlay.className='pinch-viewport';
+  pinchViewportOverlay.hidden=true;
+  document.querySelector('#canvasFrame').appendChild(pinchViewportOverlay);
+}
 // The 3D preview was removed; keep one detached canvas only for legacy helper
 // functions that are no longer initialized or exposed by the interface.
 const depthCanvas = document.createElement('canvas');
@@ -106,6 +160,8 @@ let lensPoint = null;
 let lensHoldTimer = null;
 let lensTouchActive = false;
 let lensTouchStart = null;
+const pinchPointers = new Map();
+let pinchGesture = null;
 let lastNonOriginalMode = 'lighting';
 const zoomStack = [];
 let zoomDebounceTimer = null;
@@ -984,7 +1040,9 @@ async function enterZoomView(payload){
   setGuideReady(true);
   const info=payload.refinement;
   document.querySelector('#photoName').textContent=`Zoom ${(committedZoomPercent/100).toFixed(2)}× · ${info.source_size[0]}×${info.source_size[1]}`;
-  document.querySelector('#canvasInfo').textContent='高精度中心视图 · 拖动右侧滑条可重新缩放';
+  document.querySelector('#canvasInfo').textContent=isAndroidApp
+    ? '高精度局部视图 · 双指框选可继续精修'
+    : '高精度中心视图 · 拖动右侧滑条可重新缩放';
   updateZoomUI(info);updateLightUI();
   render();
 }
@@ -1162,6 +1220,120 @@ compareDivider.addEventListener('keydown',event=>{
   event.preventDefault();renderPreviewComposite();updateCompareDividerUI();
 });
 
+function pinchDistance(points){
+  return Math.hypot(points[0].clientX-points[1].clientX,points[0].clientY-points[1].clientY);
+}
+
+function pinchViewport(points,bounds){
+  const left=Math.max(bounds.left,Math.min(points[0].clientX,points[1].clientX));
+  const top=Math.max(bounds.top,Math.min(points[0].clientY,points[1].clientY));
+  const right=Math.min(bounds.right,Math.max(points[0].clientX,points[1].clientX));
+  const bottom=Math.min(bounds.bottom,Math.max(points[0].clientY,points[1].clientY));
+  return [
+    (left-bounds.left)/Math.max(1,bounds.width),
+    (top-bounds.top)/Math.max(1,bounds.height),
+    (right-bounds.left)/Math.max(1,bounds.width),
+    (bottom-bounds.top)/Math.max(1,bounds.height)
+  ];
+}
+
+function resetPinchPreview(){
+  canvas.style.transform='';
+  canvas.style.transformOrigin='';
+  depthCanvas.style.transform='';
+  depthCanvas.style.transformOrigin='';
+  if(pinchViewportOverlay)pinchViewportOverlay.hidden=true;
+  requestAnimationFrame(updateCompareDividerUI);
+}
+
+async function commitPinchGesture(gesture){
+  resetPinchPreview();
+  if(!gesture||state.inferenceBusy||!currentAnalysisId)return;
+  const status=document.querySelector('#aiStatus');
+  if(gesture.ratio<.88){
+    if(zoomStack.length)zoomOut();
+    else{
+      status.className='ai-status';
+      status.textContent='已经是整体视图';
+    }
+    return;
+  }
+  if(gesture.ratio<1.08)return;
+  const region=gesture.region;
+  const width=region[2]-region[0],height=region[3]-region[1];
+  if(width*canvas.width<48||height*canvas.height<48){
+    status.className='ai-status error';
+    status.textContent='双指框选区域太窄，请让两个触点形成更大的对角矩形';
+    return;
+  }
+  const localGain=1/Math.max(width,height);
+  const rawTarget=Math.max(committedZoomPercent+25,committedZoomPercent*localGain);
+  requestedZoomPercent=Math.min(300,Math.round(rawTarget/25)*25);
+  updateZoomUI();
+  status.className='ai-status busy';
+  status.textContent='正在把双指对角矩形作为新视口，以 1008 px 重新计算深度…';
+  await runLocalRefinement(region);
+  if(!zoomStack.length){
+    committedZoomPercent=100;requestedZoomPercent=100;updateZoomUI();
+  }
+}
+
+if(isAndroidApp){
+  canvas.addEventListener('pointerdown',event=>{
+    if(event.pointerType!=='touch'||state.regionSelecting||state.inferenceBusy||!currentAnalysisId)return;
+    pinchPointers.set(event.pointerId,{clientX:event.clientX,clientY:event.clientY});
+    canvas.setPointerCapture?.(event.pointerId);
+    if(pinchPointers.size!==2)return;
+    clearTimeout(lensHoldTimer);lensHoldTimer=null;lensTouchStart=null;
+    if(lensActive||lensTouchActive)closeInspectionLens();
+    const points=[...pinchPointers.values()];
+    const bounds=canvas.getBoundingClientRect();
+    pinchGesture={
+      pointerIds:new Set(pinchPointers.keys()),bounds,
+      startDistance:Math.max(1,pinchDistance(points)),ratio:1,
+      region:pinchViewport(points,bounds)
+    };
+  });
+  canvas.addEventListener('pointermove',event=>{
+    if(!pinchPointers.has(event.pointerId))return;
+    pinchPointers.set(event.pointerId,{clientX:event.clientX,clientY:event.clientY});
+    if(!pinchGesture||pinchPointers.size<2)return;
+    event.preventDefault();
+    const points=[...pinchPointers.values()].slice(0,2);
+    pinchGesture.ratio=pinchDistance(points)/pinchGesture.startDistance;
+    pinchGesture.region=pinchViewport(points,pinchGesture.bounds);
+    const frameBounds=document.querySelector('#canvasFrame').getBoundingClientRect();
+    const left=Math.min(points[0].clientX,points[1].clientX)-frameBounds.left;
+    const top=Math.min(points[0].clientY,points[1].clientY)-frameBounds.top;
+    pinchViewportOverlay.hidden=false;
+    pinchViewportOverlay.style.left=`${left}px`;
+    pinchViewportOverlay.style.top=`${top}px`;
+    pinchViewportOverlay.style.width=`${Math.abs(points[0].clientX-points[1].clientX)}px`;
+    pinchViewportOverlay.style.height=`${Math.abs(points[0].clientY-points[1].clientY)}px`;
+    const midpointX=(points[0].clientX+points[1].clientX)/2-pinchGesture.bounds.left;
+    const midpointY=(points[0].clientY+points[1].clientY)/2-pinchGesture.bounds.top;
+    const previewScale=Math.max(.78,Math.min(1.55,pinchGesture.ratio));
+    canvas.style.transformOrigin=`${midpointX}px ${midpointY}px`;
+    canvas.style.transform=`scale(${previewScale})`;
+    const status=document.querySelector('#aiStatus');
+    status.className='ai-status';
+    status.textContent=pinchGesture.ratio>=1
+      ? '松手后将双指触点的对角矩形作为局部视口重新推理'
+      : '继续收拢并松手可退出局部视图';
+  });
+  const finishPinch=event=>{
+    if(!pinchPointers.has(event.pointerId))return;
+    const completed=pinchGesture&&pinchGesture.pointerIds.has(event.pointerId)?{...pinchGesture}:null;
+    pinchPointers.delete(event.pointerId);
+    if(!completed)return;
+    pinchGesture=null;
+    pinchPointers.clear();
+    commitPinchGesture(completed);
+  };
+  canvas.addEventListener('pointerup',finishPinch);
+  canvas.addEventListener('pointercancel',finishPinch);
+}
+
 function refreshLensComposite(){
   if(aiNormalReady&&aiLineartReady&&state.previewMode!=='guide')renderPreviewComposite();
   else render();
@@ -1175,14 +1347,15 @@ function closeInspectionLens(){
   lensActive=false;lensTouchActive=false;lensPoint=null;refreshLensComposite();
 }
 canvas.addEventListener('pointerdown',event=>{
-  if(event.pointerType!=='touch'||state.regionSelecting||state.previewMode==='compare'||!aiNormalReady)return;
+  if(event.pointerType!=='touch'||state.regionSelecting||state.previewMode==='compare'||!aiNormalReady
+    ||(isAndroidApp&&pinchPointers.size>1))return;
   lensTouchStart={x:event.clientX,y:event.clientY};
   lensHoldTimer=setTimeout(()=>{
     lensTouchActive=true;canvas.setPointerCapture(event.pointerId);setLensFromPointer(event);
   },420);
 });
 canvas.addEventListener('pointermove',event=>{
-  if(state.regionSelecting||state.previewMode==='compare')return;
+  if(state.regionSelecting||state.previewMode==='compare'||(isAndroidApp&&pinchGesture))return;
   if(lensTouchStart&&!lensTouchActive&&Math.hypot(event.clientX-lensTouchStart.x,event.clientY-lensTouchStart.y)>9){
     clearTimeout(lensHoldTimer);lensHoldTimer=null;lensTouchStart=null;
   }
@@ -1399,12 +1572,17 @@ async function performLocalRefinement(region){
   status.className='ai-status busy';
   status.textContent='正在把当前 Zoom 视口以 1008 px 重新计算深度与光影…';
   if(!currentAnalysisId)throw new Error('请先完成一次整体分析');
-  const form=new FormData();
-  form.append('analysis_id',currentAnalysisId);
-  form.append('region',JSON.stringify(region));
-  const response=await fetch('/api/refine',{method:'POST',body:form});
-  const payload=await response.json();
-  if(!response.ok)throw new Error(payload.detail||'局部精修失败');
+  let payload;
+  if(isAndroidApp){
+    payload=await invokeAndroid('refine',currentAnalysisId,JSON.stringify(region));
+  }else{
+    const form=new FormData();
+    form.append('analysis_id',currentAnalysisId);
+    form.append('region',JSON.stringify(region));
+    const response=await fetch('/api/refine',{method:'POST',body:form});
+    payload=await response.json();
+    if(!response.ok)throw new Error(payload.detail||'局部精修失败');
+  }
   await enterZoomView(payload);
   const info=payload.refinement;
   await new Promise(resolve=>setTimeout(resolve,GPU_COOLDOWN_MS));
@@ -1438,10 +1616,21 @@ async function performAIAnalysis(isSupplement=false){
       // The built-in demo is an abstract shield, not a photographed figure.
       prompt='circle';
     }
-    const form=new FormData();form.append('file',file);form.append('prompt',prompt);form.append('regions',JSON.stringify(supplementRegions));
-    const response=await fetch('/api/analyze',{method:'POST',body:form});
-    const payload=await response.json();
-    if(!response.ok)throw new Error(payload.detail||'分析失败');
+    let payload;
+    if(isAndroidApp){
+      payload=await invokeAndroid(
+        'analyze',
+        await blobToDataURL(file),
+        file.name||'miniature.png',
+        JSON.stringify(supplementRegions),
+        prompt
+      );
+    }else{
+      const form=new FormData();form.append('file',file);form.append('prompt',prompt);form.append('regions',JSON.stringify(supplementRegions));
+      const response=await fetch('/api/analyze',{method:'POST',body:form});
+      payload=await response.json();
+      if(!response.ok)throw new Error(payload.detail||'分析失败');
+    }
     if(!isSupplement)resetZoomState();
     currentAnalysisId=payload.id;
     const [maskImage,normalImage,lineartImage,depthImage]=await Promise.all([
@@ -1569,7 +1758,11 @@ function canvasToBlob(source,type='image/png'){
   ));
 }
 
-function downloadBlob(blob,filename){
+async function downloadBlob(blob,filename){
+  if(isAndroidApp){
+    await invokeAndroid('saveFile',await blobToDataURL(blob),filename,blob.type||'application/octet-stream');
+    return;
+  }
   const url=URL.createObjectURL(blob);
   const link=document.createElement('a');
   link.href=url;link.download=filename;
@@ -1826,22 +2019,31 @@ exportMenu.addEventListener('click',async event=>{
     const frames=captureExportFrames();
     if(action==='comparison'){
       const sheet=createComparisonSheet(frames);
-      downloadBlob(await canvasToBlob(sheet),exportFilename('reference-board','png'));
+      await downloadBlob(await canvasToBlob(sheet),exportFilename('reference-board','png'));
       setExportStatus('高清对照 PNG 已导出','success');
     }else if(action==='mp4'){
       setExportStatus('正在生成微信对比视频…');
-      const form=new FormData();
-      form.append('original',await canvasToBlob(frames.original),'original.png');
-      form.append('nmm',await canvasToBlob(frames.painted),'nmm.png');
-      const response=await fetch('/api/export-mp4',{method:'POST',body:form});
-      if(!response.ok){
-        const payload=await response.json().catch(()=>null);
-        throw new Error(payload?.detail||'MP4 视频生成失败');
+      if(isAndroidApp){
+        await invokeAndroid(
+          'exportMp4',
+          await blobToDataURL(await canvasToBlob(frames.original)),
+          await blobToDataURL(await canvasToBlob(frames.painted)),
+          exportFilename('wechat-comparison','mp4')
+        );
+      }else{
+        const form=new FormData();
+        form.append('original',await canvasToBlob(frames.original),'original.png');
+        form.append('nmm',await canvasToBlob(frames.painted),'nmm.png');
+        const response=await fetch('/api/export-mp4',{method:'POST',body:form});
+        if(!response.ok){
+          const payload=await response.json().catch(()=>null);
+          throw new Error(payload?.detail||'MP4 视频生成失败');
+        }
+        await downloadBlob(await response.blob(),exportFilename('wechat-comparison','mp4'));
       }
-      downloadBlob(await response.blob(),exportFilename('wechat-comparison','mp4'));
       setExportStatus('微信对比视频已导出','success');
     }else{
-      downloadBlob(await canvasToBlob(frames.current),exportFilename('current-view','png'));
+      await downloadBlob(await canvasToBlob(frames.current),exportFilename('current-view','png'));
       setExportStatus('当前画面已导出','success');
     }
   }catch(error){

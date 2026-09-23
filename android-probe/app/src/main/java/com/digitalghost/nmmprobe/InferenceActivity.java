@@ -17,14 +17,13 @@ import java.io.FileOutputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * Transparent, top-priority, one-shot inference process. Each model gets a
- * fresh process because ORT/XNNPACK retains its native arena after close().
- */
+/** One-shot isolated model process. ORT native arenas disappear with it. */
 public final class InferenceActivity extends Activity {
     static final String ACTION_RESULT = "com.digitalghost.nmmprobe.INFERENCE_RESULT";
     static final String EXTRA_STAGE = "stage";
     static final String EXTRA_ERROR = "error";
+    static final String EXTRA_INPUT_FILE = "input_file";
+    static final String EXTRA_OUTPUT_FILE = "output_file";
     static final String STAGE_SAM = "sam";
     static final String STAGE_DA3 = "da3";
     static final String INPUT_FILE = "analysis-input.png";
@@ -49,42 +48,41 @@ public final class InferenceActivity extends Activity {
         String error = null;
         Bitmap bitmap = null;
         try {
-            bitmap = BitmapFactory.decodeFile(new File(getCacheDir(), INPUT_FILE).getAbsolutePath());
+            String inputName = getIntent().getStringExtra(EXTRA_INPUT_FILE);
+            if (inputName == null || inputName.isBlank()) inputName = INPUT_FILE;
+            String outputName = getIntent().getStringExtra(EXTRA_OUTPUT_FILE);
+            if (outputName == null || outputName.isBlank()) {
+                outputName = STAGE_SAM.equals(stage) ? MASK_FILE : DEPTH_FILE;
+            }
+            bitmap = BitmapFactory.decodeFile(new File(getCacheDir(), inputName).getAbsolutePath());
             if (bitmap == null) throw new IllegalStateException("无法读取待分析图片");
             ModelRunner runner = new ModelRunner(
                     new File(getFilesDir(), "sam3-miniature-1008.onnx"),
                     new File(getFilesDir(), "da3-large-1008x756.onnx"));
-            float[] values;
-            File output;
-            if (STAGE_SAM.equals(stage)) {
-                values = runner.runSam(bitmap);
-                output = new File(getCacheDir(), MASK_FILE);
-            } else {
-                values = runner.runDa3(bitmap);
-                output = new File(getCacheDir(), DEPTH_FILE);
-            }
-            writeArray(output, bitmap.getWidth(), bitmap.getHeight(), values);
+            float[] values = STAGE_SAM.equals(stage)
+                    ? runner.runSam(bitmap) : runner.runDa3(bitmap);
+            writeArray(new File(getCacheDir(), outputName), bitmap.getWidth(), bitmap.getHeight(), values);
         } catch (Throwable failure) {
             error = failure.getMessage() == null
                     ? failure.getClass().getSimpleName() : failure.getMessage();
-            android.util.Log.e("NMMAndroid", stage + " isolated inference failed", failure);
+            android.util.Log.e("NMMAndroid", "Local inference failed", failure);
         } finally {
             if (bitmap != null) bitmap.recycle();
         }
-
         Intent result = new Intent(ACTION_RESULT);
         result.setPackage(getPackageName());
         result.putExtra(EXTRA_STAGE, stage);
-        if (error != null) result.putExtra(EXTRA_ERROR, error);
+        result.putExtra(EXTRA_ERROR, error);
         sendBroadcast(result);
-        runOnUiThread(this::finishAndRelease);
+        new Handler(Looper.getMainLooper()).postDelayed(this::finishAndRelease, 220);
     }
 
     private void finishAndRelease() {
+        // This transparent activity shares the editor's task. Removing the task
+        // would also close StudioActivity after every model stage.
         finish();
-        // The process itself is the deterministic XNNPACK memory boundary.
         new Handler(Looper.getMainLooper()).postDelayed(
-                () -> Process.killProcess(Process.myPid()), 400);
+                () -> Process.killProcess(Process.myPid()), 120);
     }
 
     private static void writeArray(File file, int width, int height, float[] values)

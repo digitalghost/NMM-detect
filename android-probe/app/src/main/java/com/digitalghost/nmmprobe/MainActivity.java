@@ -96,7 +96,7 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(inferenceReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(inferenceReceiver, filter);
+            registerReceiver(inferenceReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         }
         receiverRegistered = true;
         updateModelStatus();

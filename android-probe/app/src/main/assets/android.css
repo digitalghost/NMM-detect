@@ -1,0 +1,72 @@
+/* Android landscape shell: every desktop feature remains available, while the
+   three working areas scroll independently on a tablet-sized viewport. */
+html, body { width: 100%; height: 100%; overflow: hidden; overscroll-behavior: none; }
+body { background: #0a0a09; }
+.app-shell { height: 100vh; min-height: 0; padding: 7px; display: flex; flex-direction: column; }
+.topbar { width: 100%; max-width: none; height: 42px; min-height: 42px; margin: 0 0 6px; gap: 9px; }
+.brand-mark { width: 31px; height: 31px; font-size: 20px; }
+.eyebrow { font-size: 6px; }
+h1 { font-size: 15px; }
+.status { padding: 5px 9px; font-size: 8px; }
+.workspace {
+  width: 100%; max-width: none; min-height: 0; height: calc(100vh - 55px);
+  grid-template-columns: clamp(190px, 20vw, 255px) minmax(390px, 1fr) clamp(205px, 22vw, 275px);
+  overflow: hidden;
+}
+.panel { min-height: 0; padding: 13px; overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; }
+.lighting {
+  grid-column: auto; display: block; align-items: initial; border-top: 0; border-left: 1px solid var(--line);
+}
+.lighting .step-title { display: flex; }
+.lighting .control-label:first-of-type, .lighting .light-pad, .lighting .angle-readout { display: block; }
+.stage-wrap { min-height: 0; overflow: hidden; }
+.canvas-frame { min-height: 0; }
+.reflection-legend { min-height: 43px; padding: 5px 9px; gap: 10px; flex-wrap: wrap; }
+.capture-tip { margin-top: 7px; padding: 7px; }
+.capture-tip span { font-size: 6px; line-height: 1.4; }
+.correction-block { margin-top: 12px; padding-top: 12px; }
+.stage-toolbar { min-height: 45px; padding: 7px 11px; gap: 8px; }
+.stage-toolbar strong { font-size: 9px; margin-bottom: 2px; }
+.stage-toolbar span { font-size: 7px; }
+.compare-tools button { min-height: 28px; padding: 4px 7px; }
+.android-app .zoom-control { display: none !important; }
+.android-app .compare-tools { right: 18px; }
+.android-app .lighting { right: 20px; }
+.pinch-viewport {
+  position: absolute; z-index: 19; pointer-events: none;
+  border: 1px solid rgba(88,201,255,.95);
+  background: rgba(88,201,255,.08);
+  box-shadow: 0 0 0 1px rgba(4,10,18,.7), 0 0 22px rgba(88,201,255,.34);
+}
+.pinch-viewport::before,
+.pinch-viewport::after {
+  content: ''; position: absolute; width: 9px; height: 9px; border-radius: 50%;
+  background: #d9ff43; box-shadow: 0 0 12px rgba(217,255,67,.75);
+}
+.pinch-viewport::before { left: -5px; top: -5px; }
+.pinch-viewport::after { right: -5px; bottom: -5px; }
+.step-title { margin-bottom: 11px; }
+.slider-row { margin-top: 9px; }
+.light-pad { width: min(128px, 100%); margin-inline: auto; }
+.angle-readout { margin-bottom: 10px; }
+.palette-label { margin-top: 12px; }
+.advanced-details { margin-top: 12px; }
+.details-body { padding-bottom: 10px; }
+.tip-card { margin-top: 12px; padding: 9px; }
+.compact-tip { margin: 8px 0; }
+.export-control { position: sticky; bottom: -13px; padding: 8px 0 3px; background: linear-gradient(transparent, var(--panel) 25%); z-index: 8; }
+.primary-button { min-height: 38px; }
+
+@media (max-height: 620px) {
+  .topbar { display: none; }
+  .app-shell { padding: 4px; }
+  .workspace { height: calc(100vh - 8px); }
+  .panel { padding: 9px; }
+  .reflection-legend { min-height: 36px; }
+}
+
+@media (max-width: 720px) {
+  .workspace { display: grid; grid-template-columns: 180px minmax(330px, 1fr) 195px; }
+  .controls { border-right: 1px solid var(--line); border-bottom: 0; }
+  .stage-wrap { min-height: 0; }
+}

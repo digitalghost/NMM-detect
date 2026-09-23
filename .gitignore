@@ -11,3 +11,6 @@ android-probe/**/build/
 android-probe/local.properties
 android-probe/models/
 android-probe/app/libs/*.aar
+android-probe/app/src/main/assets/index.html
+android-probe/app/src/main/assets/styles.css
+android-probe/app/src/main/assets/app.js

@@ -30,6 +30,17 @@ android {
     }
 }
 
+val syncWebAssets by tasks.registering(Copy::class) {
+    from(rootProject.projectDir.parentFile) {
+        include("index.html", "styles.css", "app.js")
+    }
+    into(layout.projectDirectory.dir("src/main/assets"))
+}
+
+tasks.named("preBuild") {
+    dependsOn(syncWebAssets)
+}
+
 dependencies {
     implementation(files("libs/onnxruntime-android-1.30.0.aar"))
 }
