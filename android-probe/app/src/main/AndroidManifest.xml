@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:largeHeap="true"
+        android:label="NMM 本地预演"
+        android:theme="@style/AppTheme">
+        <activity
+            android:name=".MainActivity"
+            android:screenOrientation="portrait"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".InferenceActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:process=":inference"
+            android:theme="@style/InferenceOverlay" />
+    </application>
+</manifest>

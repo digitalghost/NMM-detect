@@ -1,7 +1,13 @@
 .venv/
+.venv-executorch/
 .models/
 .cache/
 .DS_Store
 __pycache__/
 *.pyc
 output/
+android-probe/.gradle/
+android-probe/**/build/
+android-probe/local.properties
+android-probe/models/
+android-probe/app/libs/*.aar
