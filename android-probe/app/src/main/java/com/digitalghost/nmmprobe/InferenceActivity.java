@@ -59,9 +59,10 @@ public final class InferenceActivity extends Activity {
             ModelRunner runner = new ModelRunner(
                     new File(getFilesDir(), "sam3-miniature-1008.onnx"),
                     new File(getFilesDir(), "da3-large-1008x756.onnx"));
-            float[] values = STAGE_SAM.equals(stage)
-                    ? runner.runSam(bitmap) : runner.runDa3(bitmap);
-            writeArray(new File(getCacheDir(), outputName), bitmap.getWidth(), bitmap.getHeight(), values);
+            ModelRunner.DepthResult depth = STAGE_SAM.equals(stage) ? null : runner.runDa3(bitmap);
+            float[] values = depth == null ? runner.runSam(bitmap) : depth.depth;
+            writeArray(new File(getCacheDir(), outputName), bitmap.getWidth(), bitmap.getHeight(), values,
+                    depth == null ? null : depth.camera);
         } catch (Throwable failure) {
             error = failure.getMessage() == null
                     ? failure.getClass().getSimpleName() : failure.getMessage();
@@ -85,7 +86,7 @@ public final class InferenceActivity extends Activity {
                 () -> Process.killProcess(Process.myPid()), 120);
     }
 
-    private static void writeArray(File file, int width, int height, float[] values)
+    private static void writeArray(File file, int width, int height, float[] values, float[] camera)
             throws Exception {
         try (DataOutputStream output = new DataOutputStream(
                 new BufferedOutputStream(new FileOutputStream(file), 1024 * 1024))) {
@@ -93,6 +94,7 @@ public final class InferenceActivity extends Activity {
             output.writeInt(height);
             output.writeInt(values.length);
             for (float value : values) output.writeFloat(value);
+            if (camera != null) for (float value : camera) output.writeFloat(value);
         }
     }
 

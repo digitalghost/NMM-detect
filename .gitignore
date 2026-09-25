@@ -1,7 +1,10 @@
 .venv/
+dist/
 .venv-executorch/
 .models/
 .cache/
+.serena/
+:memory:.ses
 .DS_Store
 __pycache__/
 *.pyc

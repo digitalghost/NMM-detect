@@ -5,9 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#060b13" />
     <title>NMM 光影预演室</title>
-    <link rel="stylesheet" href="styles.css?v=20260920-11" />
+    <link rel="stylesheet" href="styles.css?v=20260925-1" />
   </head>
   <body>
+    <div id="inferenceOverlay" class="inference-overlay" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <div class="inference-card">
+        <div class="inference-spinner" aria-hidden="true"><span></span></div>
+        <p class="inference-eyebrow">LOCAL AI · PROCESSING</p>
+        <strong>正在识别并重建模型</strong>
+        <span id="inferenceOverlayMessage">正在准备本地 AI 分析…</span>
+        <small>所有处理都在本机完成，请保持应用在前台</small>
+        <small id="analysisElapsed">已用时 0 秒 · 通常需要 1–3 分钟</small>
+      </div>
+    </div>
     <main class="app-shell">
       <header class="topbar">
         <div class="brand-mark">N</div>
@@ -23,10 +33,12 @@
           <div class="step-block">
             <div class="step-title"><span>照片与分析</span></div>
             <label class="upload-button" for="imageInput">
-              <span>＋</span> 导入模型照片
+              <span>＋</span> 拍摄或导入照片
             </label>
-            <input id="imageInput" type="file" accept="image/*" hidden />
+          <input id="imageInput" type="file" accept="image/*,.heic,.heif,.hif" hidden />
             <p id="aiStatus" class="ai-status" aria-live="polite">最高精度 1008 px · 完全本地运行</p>
+            <button id="retryAnalysis" class="secondary-button" type="button" hidden>重新分析这张照片</button>
+            <p class="android-gesture-hint" hidden>拍照或选择照片后自动分析。完成后拖动灯光，双指缩放查看细节。</p>
             <div class="capture-tip">
               <i aria-hidden="true"></i>
               <p><b>细节识别推荐</b><span>使用 40–60% 中性哑光灰补土，并从侧上方柔和打光。避免纯黑、纯白、亮面和金属色补土。</span></p>
@@ -81,7 +93,7 @@
           </div>
         </section>
 
-        <aside class="panel lighting">
+        <aside class="panel lighting" id="lightingPanel">
           <div class="step-title"><span>NMM 效果</span></div>
           <div class="auto-light-card">
             <i>✦</i>
@@ -147,30 +159,68 @@
                 <span>自动补光</span><output id="fillLightValue">28%</output>
                 <input id="fillLight" type="range" min="0" max="70" value="28" />
               </label>
+              <div class="android-value-options" data-control="fillLight" aria-label="自动补光强度">
+                <button type="button" data-value="0"><b>关闭</b><small>0%</small></button>
+                <button type="button" data-value="16"><b>柔和</b><small>16%</small></button>
+                <button type="button" data-value="28"><b>推荐</b><small>28%</small></button>
+                <button type="button" data-value="50"><b>增强</b><small>50%</small></button>
+              </div>
               <label class="slider-row wide detail-control">
                 <span>细节光</span><output id="detailLightValue">35%</output>
                 <input id="detailLight" type="range" min="0" max="100" value="35" disabled />
               </label>
+              <div class="android-value-options" data-control="detailLight" aria-label="细节光强度">
+                <button type="button" data-value="0"><b>关闭</b><small>0%</small></button>
+                <button type="button" data-value="35"><b>均衡</b><small>35%</small></button>
+                <button type="button" data-value="68"><b>清晰</b><small>68%</small></button>
+                <button type="button" data-value="85"><b>强化</b><small>85%</small></button>
+              </div>
               <label class="slider-row wide detail-control">
                 <span>细节尺度</span><output id="detailScaleValue">4 px</output>
                 <input id="detailScale" type="range" min="1" max="12" value="4" disabled />
               </label>
+              <div class="android-value-options compact" data-control="detailScale" aria-label="细节尺度">
+                <button type="button" data-value="2"><b>精细</b><small>2 px</small></button>
+                <button type="button" data-value="4"><b>标准</b><small>4 px</small></button>
+                <button type="button" data-value="8"><b>宽广</b><small>8 px</small></button>
+              </div>
               <label class="slider-row wide detail-control">
                 <span>微结构光照</span><output id="detailStrengthValue">28%</output>
                 <input id="detailStrength" type="range" min="0" max="100" value="28" disabled />
               </label>
+              <div class="android-value-options compact" data-control="detailStrength" aria-label="微结构光照强度">
+                <button type="button" data-value="0"><b>关闭</b><small>0%</small></button>
+                <button type="button" data-value="28"><b>自然</b><small>28%</small></button>
+                <button type="button" data-value="55"><b>鲜明</b><small>55%</small></button>
+              </div>
               <label class="slider-row wide">
                 <span>反射层次</span><output id="reflectionsValue">3 层</output>
                 <input id="reflections" type="range" min="1" max="3" value="3" />
               </label>
+              <div class="android-value-options compact" data-control="reflections" aria-label="反射层次">
+                <button type="button" data-value="1"><b>1 层</b><small>主反射</small></button>
+                <button type="button" data-value="2"><b>2 层</b><small>冷反射</small></button>
+                <button type="button" data-value="3"><b>3 层</b><small>完整</small></button>
+              </div>
               <label class="slider-row wide">
                 <span>环境反光</span><output id="bounceValue">38%</output>
                 <input id="bounce" type="range" min="0" max="80" value="38" />
               </label>
+              <div class="android-value-options compact" data-control="bounce" aria-label="环境反光强度">
+                <button type="button" data-value="0"><b>关闭</b><small>0%</small></button>
+                <button type="button" data-value="38"><b>自然</b><small>38%</small></button>
+                <button type="button" data-value="60"><b>强烈</b><small>60%</small></button>
+              </div>
               <label class="slider-row wide">
                 <span>色阶数量</span><output id="stepsValue">7 阶</output>
                 <input id="steps" type="range" min="3" max="9" value="7" />
               </label>
+              <div class="android-value-options" data-control="steps" aria-label="色阶数量">
+                <button type="button" data-value="3"><b>3 阶</b><small>概括</small></button>
+                <button type="button" data-value="5"><b>5 阶</b><small>简洁</small></button>
+                <button type="button" data-value="7"><b>7 阶</b><small>推荐</small></button>
+                <button type="button" data-value="9"><b>9 阶</b><small>细腻</small></button>
+              </div>
             </div>
           </details>
 
@@ -191,8 +241,12 @@
             <p id="exportStatus" class="export-status" aria-live="polite"></p>
           </div>
         </aside>
+        <button id="lightingPanelToggle" class="lighting-panel-toggle" type="button"
+          aria-controls="lightingPanel" aria-expanded="true" title="收起右侧参数面板" hidden>
+          <span aria-hidden="true">›</span><b>收起参数</b>
+        </button>
       </section>
     </main>
-  <script src="app.js?v=20260920-13"></script>
+  <script src="app.js?v=20260925-1"></script>
   </body>
 </html>

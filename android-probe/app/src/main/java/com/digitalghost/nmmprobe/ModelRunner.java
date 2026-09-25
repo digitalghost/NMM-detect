@@ -101,8 +101,23 @@ final class ModelRunner {
         }
     }
 
-    float[] runDa3(Bitmap source) throws Exception {
-        Bitmap inputBitmap = Bitmap.createScaledBitmap(source, DA3_WIDTH, DA3_HEIGHT, true);
+    static final class DepthResult {
+        final float[] depth;
+        final float[] camera;
+        DepthResult(float[] depth, float[] camera) { this.depth = depth; this.camera = camera; }
+    }
+
+    DepthResult runDa3(Bitmap source) throws Exception {
+        // Fixed-shape ONNX: preserve aspect ratio and pad, never stretch the subject.
+        float scale = Math.min(DA3_WIDTH / (float)source.getWidth(), DA3_HEIGHT / (float)source.getHeight());
+        int resizedWidth = Math.max(1, Math.round(source.getWidth() * scale));
+        int resizedHeight = Math.max(1, Math.round(source.getHeight() * scale));
+        int left = (DA3_WIDTH - resizedWidth) / 2, top = (DA3_HEIGHT - resizedHeight) / 2;
+        Bitmap inputBitmap = Bitmap.createBitmap(DA3_WIDTH, DA3_HEIGHT, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas inputCanvas = new android.graphics.Canvas(inputBitmap);
+        inputCanvas.drawColor(android.graphics.Color.rgb(124, 116, 104));
+        inputCanvas.drawBitmap(source, null, new android.graphics.Rect(left, top, left + resizedWidth, top + resizedHeight),
+                new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG));
         FloatBuffer input = imageBuffer(inputBitmap, true);
         if (inputBitmap != source) inputBitmap.recycle();
 
@@ -120,7 +135,16 @@ final class ModelRunner {
             int base = values.position();
             float[] depth = new float[count];
             for (int index = 0; index < count; index++) depth[index] = values.get(base + index);
-            return resizeBilinear(depth, width, height, source.getWidth(), source.getHeight());
+            if (result.size() < 2) throw new IllegalStateException("DA3 模型缺少相机内参输出，请更新模型");
+            FloatBuffer intrinsics = ((OnnxTensor)result.get(1)).getFloatBuffer();
+            if (intrinsics.remaining() != 9) throw new IllegalStateException("DA3 相机内参维度错误");
+            float[] camera = new float[9]; intrinsics.get(camera);
+            for (float value : camera) if (!Float.isFinite(value)) throw new IllegalStateException("DA3 相机内参无效");
+            if (camera[0] <= 0 || camera[4] <= 0) throw new IllegalStateException("DA3 焦距无效");
+            camera = DepthCoordinates.unpadCamera(camera, left, top, resizedWidth, resizedHeight, source.getWidth(), source.getHeight());
+            float[] restored = DepthCoordinates.unpadDepth(depth, width, height, DA3_WIDTH, DA3_HEIGHT,
+                    left, top, resizedWidth, resizedHeight, source.getWidth(), source.getHeight());
+            return new DepthResult(restored, camera);
         }
     }
 

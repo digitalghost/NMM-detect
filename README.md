@@ -96,7 +96,7 @@ cd NMM-detect
 uv sync --python 3.12
 ```
 
-Depth Anything 3 当前需要单独安装固定版本：
+其余依赖由 `uv.lock` 固定。Depth Anything 3 上游会额外声明本项目不需要的训练依赖，因此继续以固定提交、`--no-deps` 方式安装：
 
 ```bash
 UV_CACHE_DIR=/tmp/nmm-detect-uv-cache \
@@ -220,7 +220,7 @@ http://localhost:4173
 
 - 照片不会上传到第三方推理服务；
 - 模型、推理和导出都在本机进行；
-- 分析产物保存在本地 `output/`；
+- 分析产物保存在本地 `output/`，自动限制为最近 20 次、最多 512 MB，并清理超过 7 天的缓存；
 - `output/`、`.models/` 和 `.venv/` 默认被 Git 忽略。
 
 ## 项目结构

@@ -33,7 +33,7 @@ final class ArtifactGenerator {
 
     private ArtifactGenerator() { }
 
-    static Result generate(Bitmap source, float[] inputMask, float[] inputDepth) {
+    static Result generate(Bitmap source, float[] inputMask, float[] inputDepth, float[] camera) {
         int width = source.getWidth();
         int height = source.getHeight();
         int count = width * height;
@@ -44,7 +44,8 @@ final class ArtifactGenerator {
         float[] mask = blur(clampMask(inputMask), width, height, 2);
         float[] unitDepth = normalizeDepth(inputDepth, mask);
         float[] broadDepth = maskedSmooth(unitDepth, mask, width, height, 4);
-        float[] detailDepth = maskedSmooth(unitDepth, mask, width, height, 1);
+        float[] broadNormals = PerspectiveGeometry.normals(inputDepth, inputMask, width, height, camera, false);
+        float[] detailNormals = PerspectiveGeometry.normals(inputDepth, inputMask, width, height, camera, true);
         int[] sourcePixels = new int[count];
         source.getPixels(sourcePixels, 0, width, 0, 0, width, height);
         float[] luminance = new float[count];
@@ -60,7 +61,6 @@ final class ArtifactGenerator {
         int[] normalPixels = new int[count];
         int[] detailPixels = new int[count];
         int[] linePixels = new int[count];
-        float detailGain = Math.max(width, height) / 92f;
         float broadGain = Math.max(width, height) / 64f;
 
         for (int y = 0; y < height; y++) {
@@ -78,11 +78,9 @@ final class ArtifactGenerator {
 
                 float broadDx = (broadDepth[y * width + xp] - broadDepth[y * width + xm]) * broadGain;
                 float broadDy = (broadDepth[yp * width + x] - broadDepth[ym * width + x]) * broadGain;
-                normalPixels[index] = encodeNormal(-broadDx, -broadDy, alpha);
+                normalPixels[index] = encodeNormal(broadNormals, index);
 
-                float detailDx = (detailDepth[y * width + xp] - detailDepth[y * width + xm]) * detailGain;
-                float detailDy = (detailDepth[yp * width + x] - detailDepth[ym * width + x]) * detailGain;
-                detailPixels[index] = encodeNormal(-detailDx, -detailDy, alpha);
+                detailPixels[index] = encodeNormal(detailNormals, index);
 
                 float neighborMask = Math.min(Math.min(mask[y * width + xm], mask[y * width + xp]),
                         Math.min(mask[ym * width + x], mask[yp * width + x]));
@@ -103,12 +101,11 @@ final class ArtifactGenerator {
                 bitmap(width, height, linePixels));
     }
 
-    private static int encodeNormal(float x, float y, float alpha) {
-        if (alpha <= .02f) return Color.rgb(128, 128, 255);
-        float inverse = 1f / (float) Math.sqrt(Math.max(1e-12f, x * x + y * y + 1f));
-        return Color.rgb(clamp255(Math.round((x * inverse + 1f) * 127.5f)),
-                clamp255(Math.round((y * inverse + 1f) * 127.5f)),
-                clamp255(Math.round((inverse + 1f) * 127.5f)));
+    private static int encodeNormal(float[] normals, int index) {
+        int p = index * 3;
+        return Color.rgb(clamp255((int)((normals[p]+1f)*127.5f)),
+                clamp255((int)((normals[p+1]+1f)*127.5f)),
+                clamp255((int)((normals[p+2]+1f)*127.5f)));
     }
 
     private static Bitmap bitmap(int width, int height, int[] pixels) {

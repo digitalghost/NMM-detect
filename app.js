@@ -1,6 +1,6 @@
 // Keep every local tab on one origin so browser-wide inference locks also work
 // when the app was opened once with 127.0.0.1 and once with localhost.
-if (!window.AndroidNMM && window.location.hostname === '127.0.0.1') {
+if (!window.AndroidNMM && !window.NMMMac && window.location.hostname === '127.0.0.1') {
   const canonicalUrl = new URL(window.location.href);
   canonicalUrl.hostname = 'localhost';
   window.location.replace(canonicalUrl);
@@ -14,7 +14,7 @@ if (isAndroidApp) {
   document.documentElement.classList.add('android-app');
   const mobileStyles = document.createElement('link');
   mobileStyles.rel = 'stylesheet';
-  mobileStyles.href = 'android.css';
+  mobileStyles.href = 'android.css?v=20260925-1';
   document.head.appendChild(mobileStyles);
 }
 
@@ -29,11 +29,17 @@ window.__androidNMMCallback = (requestId, succeeded, payloadText) => {
   else pending.reject(new Error(payload.detail || 'Android 本地操作失败'));
 };
 
-window.__androidNMMProgress = message => {
+function setAIStatus(message,className='busy'){
   const status = document.querySelector('#aiStatus');
-  if (!status) return;
-  status.className = 'ai-status busy';
+  if(!status)return;
+  status.className=`ai-status${className?` ${className}`:''}`;
   status.textContent = message;
+  const overlayMessage=document.querySelector('#inferenceOverlayMessage');
+  if(overlayMessage)overlayMessage.textContent=message;
+}
+
+window.__androidNMMProgress = message => {
+  setAIStatus(message,'busy');
 };
 
 function invokeAndroid(method, ...args) {
@@ -56,12 +62,6 @@ function blobToDataURL(blob) {
 
 const canvas = document.querySelector('#mainCanvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
-const pinchViewportOverlay = isAndroidApp ? document.createElement('div') : null;
-if(pinchViewportOverlay){
-  pinchViewportOverlay.className='pinch-viewport';
-  pinchViewportOverlay.hidden=true;
-  document.querySelector('#canvasFrame').appendChild(pinchViewportOverlay);
-}
 // The 3D preview was removed; keep one detached canvas only for legacy helper
 // functions that are no longer initialized or exposed by the interface.
 const depthCanvas = document.createElement('canvas');
@@ -162,6 +162,11 @@ let lensTouchActive = false;
 let lensTouchStart = null;
 const pinchPointers = new Map();
 let pinchGesture = null;
+let pinchViewScale = 1;
+let pinchViewX = 0;
+let pinchViewY = 0;
+const PINCH_MIN_SCALE = 1;
+const PINCH_MAX_SCALE = 4;
 let lastNonOriginalMode = 'lighting';
 const zoomStack = [];
 let zoomDebounceTimer = null;
@@ -181,6 +186,24 @@ let remoteInferenceOwner = null;
 let remoteInferenceTimer = null;
 let analysisHeartbeat = null;
 
+function syncAndroidValueControls(controlId=null){
+  const selector=controlId
+    ? `.android-value-options[data-control="${controlId}"]`
+    : '.android-value-options[data-control]';
+  document.querySelectorAll(selector).forEach(group=>{
+    const input=document.querySelector(`#${group.dataset.control}`);
+    if(!input)return;
+    const current=Number(input.value);
+    group.classList.toggle('is-disabled',input.disabled);
+    group.querySelectorAll('button[data-value]').forEach(button=>{
+      const active=Number(button.dataset.value)===current;
+      button.classList.toggle('active',active);
+      button.setAttribute('aria-pressed',String(active));
+      button.disabled=input.disabled;
+    });
+  });
+}
+
 function syncInferenceControls() {
   const busy = localInferenceRunning || Boolean(remoteInferenceOwner);
   const zoomed = zoomStack.length > 0;
@@ -188,7 +211,16 @@ function syncInferenceControls() {
   const controls = document.querySelector('.controls');
   controls.classList.toggle('inference-locked', busy);
   controls.setAttribute('aria-busy', String(busy));
-  ['imageInput','demoButton']
+  const overlay=document.querySelector('#inferenceOverlay');
+  const showGlobalOverlay=(isAndroidApp||Boolean(window.NMMMac))&&localInferenceRunning;
+  overlay.hidden=!showGlobalOverlay;
+  document.documentElement.classList.toggle('inference-active',showGlobalOverlay);
+  document.querySelector('.workspace').inert=showGlobalOverlay;
+  if(showGlobalOverlay){
+    const currentMessage=document.querySelector('#aiStatus').textContent.trim();
+    if(currentMessage)document.querySelector('#inferenceOverlayMessage').textContent=currentMessage;
+  }
+  ['imageInput','demoButton','retryAnalysis']
     .forEach(id => { document.querySelector(`#${id}`).disabled = busy; });
   document.querySelector('#regionSelectButton').disabled = busy || zoomed;
   ['normalSmooth','fillLight','reflections','bounce','steps'].forEach(id=>{
@@ -197,6 +229,7 @@ function syncInferenceControls() {
   document.querySelector('#detailLight').disabled=busy||!detailNormalReady;
   document.querySelector('#detailScale').disabled=busy||!detailNormalReady;
   document.querySelector('#detailStrength').disabled=busy||!detailNormalReady;
+  syncAndroidValueControls();
   document.querySelectorAll('#lightingPresets button').forEach(button=>{button.disabled=busy;});
   document.querySelectorAll('#artDirectionPresets button').forEach(button=>{button.disabled=busy;});
   const canZoom=!busy&&Boolean(currentAnalysisId);
@@ -504,6 +537,7 @@ depthCanvas.addEventListener('pointerup',()=>{depthRenderer.dragging=false;});
 depthCanvas.addEventListener('dblclick',()=>{});
 
 function sizeCanvases(w, h) {
+  if(isAndroidApp)resetPinchView();
   const max = 1100;
   const scale = Math.min(1, max / Math.max(w, h));
   const cw = Math.max(1, Math.round(w * scale));
@@ -518,14 +552,51 @@ function sizeCanvases(w, h) {
   depthPreviewReady = false;
 }
 
+// Three separable box passes approximate a Gaussian on every engine, including
+// WKWebView where CanvasRenderingContext2D.filter can silently do nothing.
+// Clamp borders and blur premultiplied colour to avoid dark/transparent halos.
+function drawBlurredImage(source, target, sigma) {
+  const width=source.width,height=source.height;
+  const pixels=source.getContext('2d').getImageData(0,0,width,height);
+  if(sigma<=0){target.putImageData(pixels,0,0);return pixels.data;}
+  let a=new Float32Array(pixels.data.length),b=new Float32Array(a.length);
+  for(let p=0;p<a.length;p+=4){
+    const alpha=pixels.data[p+3]/255;
+    a[p]=pixels.data[p]*alpha;a[p+1]=pixels.data[p+1]*alpha;a[p+2]=pixels.data[p+2]*alpha;a[p+3]=pixels.data[p+3];
+  }
+  const idealRadius=(Math.sqrt(4*sigma*sigma+1)-1)/2;
+  const radius=Math.floor(idealRadius),edgeWeight=idealRadius-radius;
+  function pass(horizontal){
+    const count=horizontal?height:width,length=horizontal?width:height;
+    const step=horizontal?4:width*4,span=radius*2+1+edgeWeight*2;
+    for(let line=0;line<count;line++){
+      const base=horizontal?line*width*4:line*4;
+      for(let channel=0;channel<4;channel++){
+        let sum=0;
+        for(let k=-radius;k<=radius;k++)sum+=a[base+Math.max(0,Math.min(length-1,k))*step+channel];
+        for(let x=0;x<length;x++){
+          const edges=a[base+Math.max(0,x-radius-1)*step+channel]+a[base+Math.min(length-1,x+radius+1)*step+channel];
+          b[base+x*step+channel]=(sum+edgeWeight*edges)/span;
+          sum+=a[base+Math.min(length-1,x+radius+1)*step+channel]-a[base+Math.max(0,x-radius)*step+channel];
+        }
+      }
+    }
+    [a,b]=[b,a];
+  }
+  // Fractional edge weights keep even the small detail-scale steps effective.
+  for(let i=0;i<3;i++){pass(true);pass(false);}
+  for(let p=0;p<a.length;p+=4){
+    const factor=a[p+3]>0?255/a[p+3]:0;
+    pixels.data[p]=a[p]*factor;pixels.data[p+1]=a[p+1]*factor;pixels.data[p+2]=a[p+2]*factor;pixels.data[p+3]=a[p+3];
+  }
+  target.putImageData(pixels,0,0);
+  return pixels.data;
+}
+
 function rebuildPhotoDetail() {
   if(!photoCanvas.width || !photoCanvas.height){photoDetailData=null;return;}
   const radius=Math.max(3,Math.min(9,Math.round(Math.max(photoCanvas.width,photoCanvas.height)/180)));
-  photoBlurCtx.save();
-  photoBlurCtx.clearRect(0,0,photoBlurCanvas.width,photoBlurCanvas.height);
-  photoBlurCtx.filter=`blur(${radius}px)`;
-  photoBlurCtx.drawImage(photoCanvas,0,0);
-  photoBlurCtx.restore();
+  drawBlurredImage(photoCanvas,photoBlurCtx,radius);
   const source=photoCtx.getImageData(0,0,photoCanvas.width,photoCanvas.height).data;
   const blurred=photoBlurCtx.getImageData(0,0,photoBlurCanvas.width,photoBlurCanvas.height).data;
   photoDetailData=new Float32Array(photoCanvas.width*photoCanvas.height);
@@ -537,6 +608,8 @@ function rebuildPhotoDetail() {
 }
 
 function createDemo() {
+  document.querySelector('#retryAnalysis').hidden=true;
+  setAIStatus('演示预览 · 导入模型照片开始分析','');
   sizeCanvases(900, 980);
   const w = photoCanvas.width, h = photoCanvas.height;
   const g = photoCtx.createRadialGradient(w*.5,h*.35,20,w*.5,h*.5,h*.72);
@@ -715,6 +788,30 @@ function buildSurfaceAnalysis(){
     patch.horizonOffset=Math.max(-.085,Math.min(.085,(patch.cy/height-.48)*.055+patch.meanNX*.025));
     patch.bandWidth=patch.kind==='plane'?.23:patch.kind==='cylinder'?.1:patch.kind==='bevel'?.075:patch.kind==='detail'?.085:.145;
   }
+  // Cells centred on a structure line or just outside a silhouette were left
+  // unlabelled by the sparse analysis grid. Rendering a whole step-sized cell
+  // without art direction made those holes visible as a regular square grid.
+  // Extend the nearest valid patch through every unlabelled cell; the actual
+  // per-pixel subject mask still determines where lighting can be painted.
+  if(patches.length){
+    const fillQueue=new Int32Array(cellCount);
+    let fillHead=0,fillTail=0;
+    for(let index=0;index<cellCount;index++){
+      if(labels[index]>=0)fillQueue[fillTail++]=index;
+    }
+    while(fillHead<fillTail){
+      const current=fillQueue[fillHead++];
+      const cy=Math.floor(current/gridWidth),cx=current-cy*gridWidth;
+      for(const [ox,oy] of neighbours){
+        const nextX=cx+ox,nextY=cy+oy;
+        if(nextX<0||nextY<0||nextX>=gridWidth||nextY>=gridHeight)continue;
+        const next=nextY*gridWidth+nextX;
+        if(labels[next]>=0)continue;
+        labels[next]=labels[current];
+        fillQueue[fillTail++]=next;
+      }
+    }
+  }
   surfaceAnalysis={step,gridWidth,gridHeight,labels,patches,summary};
   updateSurfaceStatus(surfaceAnalysis);
   return surfaceAnalysis;
@@ -783,14 +880,18 @@ function renderLightingFrame(drawOverlay=true) {
       const spec=Math.pow(Math.max(0,nx*hx+ny*hy+nz*hz),exponent);
       const fillDiffuse=Math.max(0,nx*flx+ny*fly+nz*flz);
       const fillSpec=Math.pow(Math.max(0,nx*fhx+ny*fhy+nz*fhz),Math.max(5,exponent*.62));
-      const secondary=state.reflections>=2 ? Math.pow(Math.max(0,nx*h2x+ny*h2y+nz*h2z),Math.max(4,exponent*.48))*reflectionGain : 0;
-      const tertiary=state.reflections>=3 ? Math.pow(Math.max(0,nx*h3x+ny*h3y+nz*h3z),Math.max(5,exponent*1.05))*reflectionGain : 0;
+      // Environment reflections cover a broad area, unlike the sharp key
+      // highlight. Narrow lobes previously vanished on most visible normals.
+      const secondary=state.reflections>=2 ? Math.pow(Math.max(0,nx*h2x+ny*h2y+nz*h2z),Math.max(2,exponent*.12))*reflectionGain : 0;
+      const tertiary=state.reflections>=3 ? Math.pow(Math.max(0,nx*h3x+ny*h3y+nz*h3z),Math.max(2.5,exponent*.18))*reflectionGain : 0;
       const rim=Math.pow(1-nz,3.2);
       // Primary reflection owns the complete selected metal palette. Secondary
       // and tertiary lobes are semantic guide colours layered on top.
       let primary=.055+diffuse*diffuseGain+spec*specularGain+rim*rimGain;
-      const fillLayer=Math.min(.74,.045+state.fillLight*(fillDiffuse*.5+fillSpec*.32));
-      primary=Math.max(primary,fillLayer);
+      // Add soft fill in proportion to remaining headroom. Taking max(key,
+      // fill) discarded the entire fill layer on most front-facing surfaces.
+      const fillLayer=state.fillLight*(fillDiffuse*.42+fillSpec*.24);
+      primary+=fillLayer*(1-Math.max(0,Math.min(1,primary)));
       if(detailNormalReady&&state.detailLight>0){
         const detailDiffuse=Math.max(0,nx*dlx+ny*dly+nz*dlz);
         const macroDiffuse=Math.max(0,mnx*dlx+mny*dly+mnz*dlz);
@@ -843,18 +944,16 @@ function renderLightingFrame(drawOverlay=true) {
       // with two fixed annotation colours. The cool/warm shifts are derived
       // from the current shade, which avoids cyan clashing with blue metals or
       // orange flattening gold and copper.
-      const coolWeight=Math.min(.56,Math.max(0,(secondaryGuide-.035)*2.35));
-      const warmWeight=Math.min(.5,Math.max(0,(tertiaryGuide-.04)*2.2));
+      const coolWeight=.5*(1-Math.exp(-Math.max(0,secondaryGuide)*4));
+      const warmWeight=.4*(1-Math.exp(-Math.max(0,tertiaryGuide)*4));
       if(coolWeight>0 || warmWeight>0){
         const coolTarget=[Math.max(18,r*.58),Math.min(242,g*.78+42),Math.min(255,b*.82+68)];
         const warmTarget=[Math.min(255,r*.82+54),Math.min(238,g*.72+30),Math.max(22,b*.58)];
-        const coolBias=coolWeight*coolWeight,warmBias=warmWeight*warmWeight;
-        const biasTotal=coolBias+warmBias;
-        const target=coolTarget.map((value,channel)=>(value*coolBias+warmTarget[channel]*warmBias)/biasTotal);
-        const weight=Math.max(coolWeight,warmWeight);
-        r=r*(1-weight)+target[0]*weight;
-        g=g*(1-weight)+target[1]*weight;
-        b=b*(1-weight)+target[2]*weight;
+        // Both layers contribute independently; a stronger cool reflection
+        // must not suppress changes when the warm third layer is enabled.
+        r+=(coolTarget[0]-r)*coolWeight+(warmTarget[0]-r)*warmWeight;
+        g+=(coolTarget[1]-g)*coolWeight+(warmTarget[1]-g)*warmWeight;
+        b+=(coolTarget[2]-b)*coolWeight+(warmTarget[2]-b)*warmWeight;
       }
       if(state.showOriginal){
         const detail=photoDetailData?.[p>>2]||0;
@@ -993,6 +1092,7 @@ function updateZoomUI(info=null){
 }
 
 function resetCanvasZoomPreview(){
+  if(isAndroidApp){resetPinchView();return;}
   canvas.style.transform='';
   depthCanvas.style.transform='';
 }
@@ -1224,75 +1324,70 @@ function pinchDistance(points){
   return Math.hypot(points[0].clientX-points[1].clientX,points[0].clientY-points[1].clientY);
 }
 
-function pinchViewport(points,bounds){
-  const left=Math.max(bounds.left,Math.min(points[0].clientX,points[1].clientX));
-  const top=Math.max(bounds.top,Math.min(points[0].clientY,points[1].clientY));
-  const right=Math.min(bounds.right,Math.max(points[0].clientX,points[1].clientX));
-  const bottom=Math.min(bounds.bottom,Math.max(points[0].clientY,points[1].clientY));
-  return [
-    (left-bounds.left)/Math.max(1,bounds.width),
-    (top-bounds.top)/Math.max(1,bounds.height),
-    (right-bounds.left)/Math.max(1,bounds.width),
-    (bottom-bounds.top)/Math.max(1,bounds.height)
-  ];
+function pinchMidpoint(points){
+  return {
+    x:(points[0].clientX+points[1].clientX)/2,
+    y:(points[0].clientY+points[1].clientY)/2
+  };
 }
 
-function resetPinchPreview(){
-  canvas.style.transform='';
-  canvas.style.transformOrigin='';
-  depthCanvas.style.transform='';
-  depthCanvas.style.transformOrigin='';
-  if(pinchViewportOverlay)pinchViewportOverlay.hidden=true;
+function updatePinchZoomBadge(){
+  if(!isAndroidApp)return;
+  const badge=document.querySelector('#zoomLevelBadge');
+  badge.hidden=pinchViewScale<=PINCH_MIN_SCALE+.001;
+  if(!badge.hidden)badge.textContent=`视图 ${pinchViewScale.toFixed(2)}× · 双指缩放`;
+}
+
+function applyPinchView(){
+  const transform=pinchViewScale<=PINCH_MIN_SCALE+.001
+    ? ''
+    : `translate3d(${pinchViewX}px,${pinchViewY}px,0) scale(${pinchViewScale})`;
+  canvas.style.transformOrigin=transform?'0 0':'';
+  depthCanvas.style.transformOrigin=transform?'0 0':'';
+  canvas.style.transform=transform;
+  depthCanvas.style.transform=transform;
+  updatePinchZoomBadge();
   requestAnimationFrame(updateCompareDividerUI);
 }
 
-async function commitPinchGesture(gesture){
-  resetPinchPreview();
-  if(!gesture||state.inferenceBusy||!currentAnalysisId)return;
-  const status=document.querySelector('#aiStatus');
-  if(gesture.ratio<.88){
-    if(zoomStack.length)zoomOut();
-    else{
-      status.className='ai-status';
-      status.textContent='已经是整体视图';
-    }
-    return;
-  }
-  if(gesture.ratio<1.08)return;
-  const region=gesture.region;
-  const width=region[2]-region[0],height=region[3]-region[1];
-  if(width*canvas.width<48||height*canvas.height<48){
-    status.className='ai-status error';
-    status.textContent='双指框选区域太窄，请让两个触点形成更大的对角矩形';
-    return;
-  }
-  const localGain=1/Math.max(width,height);
-  const rawTarget=Math.max(committedZoomPercent+25,committedZoomPercent*localGain);
-  requestedZoomPercent=Math.min(300,Math.round(rawTarget/25)*25);
-  updateZoomUI();
-  status.className='ai-status busy';
-  status.textContent='正在把双指对角矩形作为新视口，以 1008 px 重新计算深度…';
-  await runLocalRefinement(region);
-  if(!zoomStack.length){
-    committedZoomPercent=100;requestedZoomPercent=100;updateZoomUI();
-  }
+function resetPinchView(){
+  pinchViewScale=PINCH_MIN_SCALE;
+  pinchViewX=0;
+  pinchViewY=0;
+  pinchGesture=null;
+  pinchPointers.clear();
+  canvas.classList.remove('pinching');
+  applyPinchView();
 }
 
 if(isAndroidApp){
   canvas.addEventListener('pointerdown',event=>{
-    if(event.pointerType!=='touch'||state.regionSelecting||state.inferenceBusy||!currentAnalysisId)return;
+    if(event.pointerType!=='touch'||state.regionSelecting||state.inferenceBusy)return;
     pinchPointers.set(event.pointerId,{clientX:event.clientX,clientY:event.clientY});
     canvas.setPointerCapture?.(event.pointerId);
     if(pinchPointers.size!==2)return;
     clearTimeout(lensHoldTimer);lensHoldTimer=null;lensTouchStart=null;
     if(lensActive||lensTouchActive)closeInspectionLens();
     const points=[...pinchPointers.values()];
-    const bounds=canvas.getBoundingClientRect();
-    pinchGesture={
-      pointerIds:new Set(pinchPointers.keys()),bounds,
-      startDistance:Math.max(1,pinchDistance(points)),ratio:1,
-      region:pinchViewport(points,bounds)
+    const midpoint=pinchMidpoint(points);
+    const transformedBounds=canvas.getBoundingClientRect();
+    const baseBounds={
+      left:transformedBounds.left-pinchViewX,
+      top:transformedBounds.top-pinchViewY,
+      width:transformedBounds.width/pinchViewScale,
+      height:transformedBounds.height/pinchViewScale
     };
+    pinchGesture={
+      pointerIds:new Set(pinchPointers.keys()),
+      startDistance:Math.max(1,pinchDistance(points)),
+      startScale:pinchViewScale,
+      startX:pinchViewX,
+      startY:pinchViewY,
+      baseBounds,
+      focusX:(midpoint.x-baseBounds.left-pinchViewX)/pinchViewScale,
+      focusY:(midpoint.y-baseBounds.top-pinchViewY)/pinchViewScale
+    };
+    canvas.classList.add('pinching');
   });
   canvas.addEventListener('pointermove',event=>{
     if(!pinchPointers.has(event.pointerId))return;
@@ -1300,35 +1395,31 @@ if(isAndroidApp){
     if(!pinchGesture||pinchPointers.size<2)return;
     event.preventDefault();
     const points=[...pinchPointers.values()].slice(0,2);
-    pinchGesture.ratio=pinchDistance(points)/pinchGesture.startDistance;
-    pinchGesture.region=pinchViewport(points,pinchGesture.bounds);
-    const frameBounds=document.querySelector('#canvasFrame').getBoundingClientRect();
-    const left=Math.min(points[0].clientX,points[1].clientX)-frameBounds.left;
-    const top=Math.min(points[0].clientY,points[1].clientY)-frameBounds.top;
-    pinchViewportOverlay.hidden=false;
-    pinchViewportOverlay.style.left=`${left}px`;
-    pinchViewportOverlay.style.top=`${top}px`;
-    pinchViewportOverlay.style.width=`${Math.abs(points[0].clientX-points[1].clientX)}px`;
-    pinchViewportOverlay.style.height=`${Math.abs(points[0].clientY-points[1].clientY)}px`;
-    const midpointX=(points[0].clientX+points[1].clientX)/2-pinchGesture.bounds.left;
-    const midpointY=(points[0].clientY+points[1].clientY)/2-pinchGesture.bounds.top;
-    const previewScale=Math.max(.78,Math.min(1.55,pinchGesture.ratio));
-    canvas.style.transformOrigin=`${midpointX}px ${midpointY}px`;
-    canvas.style.transform=`scale(${previewScale})`;
+    const midpoint=pinchMidpoint(points);
+    const scaleRatio=pinchDistance(points)/pinchGesture.startDistance;
+    const targetScale=Math.max(PINCH_MIN_SCALE,Math.min(PINCH_MAX_SCALE,pinchGesture.startScale*scaleRatio));
+    const {baseBounds}=pinchGesture;
+    const unclampedX=midpoint.x-baseBounds.left-pinchGesture.focusX*targetScale;
+    const unclampedY=midpoint.y-baseBounds.top-pinchGesture.focusY*targetScale;
+    pinchViewScale=targetScale;
+    pinchViewX=Math.max(baseBounds.width*(1-targetScale),Math.min(0,unclampedX));
+    pinchViewY=Math.max(baseBounds.height*(1-targetScale),Math.min(0,unclampedY));
+    applyPinchView();
     const status=document.querySelector('#aiStatus');
     status.className='ai-status';
-    status.textContent=pinchGesture.ratio>=1
-      ? '松手后将双指触点的对角矩形作为局部视口重新推理'
-      : '继续收拢并松手可退出局部视图';
+    status.textContent=pinchViewScale<=PINCH_MIN_SCALE+.001
+      ? '整体视图 · 从关注区域向外张开双指可放大'
+      : `视图已放大 ${pinchViewScale.toFixed(2)}× · 以双指中心聚焦`;
   });
   const finishPinch=event=>{
     if(!pinchPointers.has(event.pointerId))return;
-    const completed=pinchGesture&&pinchGesture.pointerIds.has(event.pointerId)?{...pinchGesture}:null;
+    const completed=pinchGesture&&pinchGesture.pointerIds.has(event.pointerId);
     pinchPointers.delete(event.pointerId);
     if(!completed)return;
     pinchGesture=null;
     pinchPointers.clear();
-    commitPinchGesture(completed);
+    canvas.classList.remove('pinching');
+    applyPinchView();
   };
   canvas.addEventListener('pointerup',finishPinch);
   canvas.addEventListener('pointercancel',finishPinch);
@@ -1437,12 +1528,87 @@ function updateLightUI(){
   stageLight.style.left=x+'%';stageLight.style.top=y+'%';
 }
 
+const lightingPanelToggle=document.querySelector('#lightingPanelToggle');
+function setLightingPanelCollapsed(collapsed){
+  if(!isAndroidApp)return;
+  document.documentElement.classList.toggle('lighting-panel-collapsed',collapsed);
+  lightingPanelToggle.setAttribute('aria-expanded',String(!collapsed));
+  lightingPanelToggle.title=collapsed?'展开右侧参数面板':'收起右侧参数面板';
+  lightingPanelToggle.querySelector('span').textContent=collapsed?'‹':'›';
+  lightingPanelToggle.querySelector('b').textContent=collapsed?'展开参数':'收起参数';
+  document.querySelector('#lightingPanel').inert=collapsed;
+  try{localStorage.setItem('nmm-panel-collapsed',String(collapsed));}catch{}
+  requestAnimationFrame(updateCompareDividerUI);
+}
+if(isAndroidApp){
+  document.querySelector('.android-gesture-hint').hidden=false;
+  lightingPanelToggle.hidden=false;
+  try{setLightingPanelCollapsed(localStorage.getItem('nmm-panel-collapsed')==='true');}catch{}
+  lightingPanelToggle.addEventListener('click',()=>{
+    setLightingPanelCollapsed(!document.documentElement.classList.contains('lighting-panel-collapsed'));
+  });
+}
+
+let photoImportVersion=0;
+async function isHeifFile(file){
+  if(/\.(heic|heif|hif)$/i.test(file.name)||/^image\/(hei[cf]|heic-sequence|heif-sequence)$/i.test(file.type))return true;
+  const bytes=new Uint8Array(await file.slice(0,256).arrayBuffer());
+  const signature=new TextDecoder('latin1').decode(bytes);
+  return signature.slice(4,8)==='ftyp'&&/heic|heix|hevc|hevx|heim|heis|mif1|msf1/.test(signature.slice(8));
+}
+async function normalizeImportFile(file){
+  if(file.size>64*1024*1024)throw new Error('照片超过 64 MB，请选择较小的照片');
+  let blob;
+  if(isAndroidApp){
+    const result=await invokeAndroid('decodeImport',await blobToDataURL(file));
+    blob=await (await fetch(result.dataUrl)).blob();
+  }else{
+    const form=new FormData();form.append('file',file);
+    const response=await fetch('/api/import-image',{method:'POST',body:form});
+    if(!response.ok){const error=await response.json();throw new Error(error.detail||'照片转换失败');}
+    blob=await response.blob();
+  }
+  return new File([blob],file.name.replace(/\.[^.]*$/,'')+'.png',{type:'image/png'});
+}
+function previewImportFile(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image(),url=URL.createObjectURL(file);
+    img.onload=()=>{URL.revokeObjectURL(url);resolve(img);};
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('照片预览解码失败'));};
+    img.src=url;
+  });
+}
+async function importPhoto(file){
+  if(state.inferenceBusy||!file)return;
+  const importVersion=++photoImportVersion;
+  try{
+    const heif=await isHeifFile(file);
+    if(file.type&&!file.type.startsWith('image/')&&file.type!=='application/octet-stream'&&!heif)throw new Error('请选择 HEIF、HEIC、JPG、PNG 或 WebP 图片');
+    document.querySelector('#retryAnalysis').hidden=true;
+    setAIStatus(heif?'正在本地解码 HEIF / HEIC 照片…':'正在生成安全尺寸工作图…','busy');
+    const prepared=await normalizeImportFile(file);
+    const img=await previewImportFile(prepared);
+    if(importVersion!==photoImportVersion||state.inferenceBusy)return;
+    currentUploadFile=prepared;
+    sizeCanvases(img.width,img.height);
+    photoCtx.drawImage(img,0,0,photoCanvas.width,photoCanvas.height);
+    rebuildPhotoDetail();
+    maskCtx.clearRect(0,0,maskCanvas.width,maskCanvas.height);
+    aiNormalData=null;aiNormalReady=false;aiLineartReady=false;currentAnalysisId=null;
+    supplementRegions=[];setRegionMode(false);setGuideReady(false);
+    document.querySelector('#clearRegionsButton').disabled=true;
+    state.maskDirty=true;state.hasImage=true;
+    document.querySelector('#photoName').textContent=file.name;
+    setAIStatus('照片已载入，正在自动分析…');
+    render();
+    await runAIAnalysis(false);
+  }catch(error){if(importVersion===photoImportVersion)setAIStatus(error.message||'照片无法读取，请重试','error');}
+}
 document.querySelector('#imageInput').addEventListener('change',e=>{
-  if(state.inferenceBusy){e.target.value='';return;}
-  const file=e.target.files[0]; if(!file)return;
-  currentUploadFile=file;
-  const img=new Image(); img.onload=()=>{ sizeCanvases(img.width,img.height);photoCtx.drawImage(img,0,0,photoCanvas.width,photoCanvas.height);rebuildPhotoDetail();maskCtx.clearRect(0,0,maskCanvas.width,maskCanvas.height);aiNormalData=null;aiNormalReady=false;aiLineartReady=false;currentAnalysisId=null;supplementRegions=[];setRegionMode(false);setGuideReady(false);document.querySelector('#clearRegionsButton').disabled=true;state.maskDirty=true;state.hasImage=true;document.querySelector('#photoName').textContent=file.name;document.querySelector('#aiStatus').textContent='照片已载入，正在自动分析…';render();URL.revokeObjectURL(img.src);requestAnimationFrame(()=>runAIAnalysis(false)); }; img.src=URL.createObjectURL(file);
+  const file=e.target.files[0];e.target.value='';
+  void importPhoto(file);
 });
+document.querySelector('#retryAnalysis').onclick=()=>runAIAnalysis(false);
 document.querySelector('#demoButton').onclick=createDemo;
 document.querySelector('#regionSelectButton').onclick=()=>setRegionMode(!state.regionSelecting);
 document.querySelector('#zoomRange').addEventListener('input',event=>previewZoom(+event.target.value));
@@ -1462,6 +1628,8 @@ function applyLightingPreset(name){
   document.querySelector('#fillLightValue').value=Math.round(state.fillLight*100)+'%';
   document.querySelector('#detailLight').value=Math.round(state.detailLight*100);
   document.querySelector('#detailLightValue').value=Math.round(state.detailLight*100)+'%';
+  syncAndroidValueControls('fillLight');
+  syncAndroidValueControls('detailLight');
   render();
 }
 document.querySelectorAll('#lightingPresets button').forEach(button=>button.addEventListener('click',()=>applyLightingPreset(button.dataset.lighting)));
@@ -1540,37 +1708,26 @@ document.addEventListener('keydown',event=>{
 });
 
 function loadImage(url){
-  return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=url+'?t='+Date.now();});
+  if(!url)return Promise.reject(new Error('分析结果缺少图片，请重新分析'));
+  return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error('分析图片加载失败，请重新分析'));img.src=url+'?t='+Date.now();});
 }
 
 function rebuildAINormals(renderAfter=true){
   if(!aiNormalReady)return;
-  normalFilteredCtx.save();
-  normalFilteredCtx.clearRect(0,0,normalFilteredCanvas.width,normalFilteredCanvas.height);
-  normalFilteredCtx.filter=state.normalSmooth>0?`blur(${state.normalSmooth}px)`:'none';
-  normalFilteredCtx.drawImage(normalSourceCanvas,0,0);
-  normalFilteredCtx.restore();
-  aiNormalData=normalFilteredCtx.getImageData(0,0,normalFilteredCanvas.width,normalFilteredCanvas.height).data;
+  aiNormalData=drawBlurredImage(normalSourceCanvas,normalFilteredCtx,state.normalSmooth);
   surfaceAnalysis=null;
   if(renderAfter)render();
 }
 
 function rebuildDetailNormals(renderAfter=true){
   if(!detailNormalReady){detailNormalData=null;return;}
-  detailNormalFilteredCtx.save();
-  detailNormalFilteredCtx.clearRect(0,0,detailNormalFilteredCanvas.width,detailNormalFilteredCanvas.height);
   const radius=Math.max(0,(state.detailScale-1)*.42);
-  detailNormalFilteredCtx.filter=radius>0?`blur(${radius}px)`:'none';
-  detailNormalFilteredCtx.drawImage(detailNormalSourceCanvas,0,0);
-  detailNormalFilteredCtx.restore();
-  detailNormalData=detailNormalFilteredCtx.getImageData(0,0,detailNormalFilteredCanvas.width,detailNormalFilteredCanvas.height).data;
+  detailNormalData=drawBlurredImage(detailNormalSourceCanvas,detailNormalFilteredCtx,radius);
   if(renderAfter)render();
 }
 
 async function performLocalRefinement(region){
-  const status=document.querySelector('#aiStatus');
-  status.className='ai-status busy';
-  status.textContent='正在把当前 Zoom 视口以 1008 px 重新计算深度与光影…';
+  setAIStatus('正在把当前 Zoom 视口以 1008 px 重新计算深度与光影…','busy');
   if(!currentAnalysisId)throw new Error('请先完成一次整体分析');
   let payload;
   if(isAndroidApp){
@@ -1600,11 +1757,9 @@ async function runLocalRefinement(region){
 
 async function performAIAnalysis(isSupplement=false){
   if(pendingLocalRegion)return performLocalRefinement(pendingLocalRegion);
-  const status=document.querySelector('#aiStatus');
-  status.className='ai-status busy';
-  status.textContent=isSupplement
+  setAIStatus(isSupplement
     ? '正在按框选区域增补主体并重建高精度形体…'
-    : '正在进行最高精度主体聚焦估算，约需 2–3 分钟…';
+    : '正在进行最高精度主体聚焦估算，约需 2–3 分钟…','busy');
   let finalStatus = '';
   let succeeded = false;
   try{
@@ -1633,9 +1788,10 @@ async function performAIAnalysis(isSupplement=false){
     }
     if(!isSupplement)resetZoomState();
     currentAnalysisId=payload.id;
-    const [maskImage,normalImage,lineartImage,depthImage]=await Promise.all([
+    const [maskImage,normalImage,lineartImage,depthImage,detailNormalImage]=await Promise.all([
       loadImage(payload.artifacts.mask),loadImage(payload.artifacts.normals),
-      loadImage(payload.artifacts.lineart),loadImage(payload.artifacts.depth)
+      loadImage(payload.artifacts.lineart),loadImage(payload.artifacts.depth),
+      loadImage(payload.artifacts.detail_normals)
     ]);
     const temp=document.createElement('canvas');temp.width=canvas.width;temp.height=canvas.height;
     const tempCtx=temp.getContext('2d',{willReadFrequently:true});tempCtx.drawImage(maskImage,0,0,temp.width,temp.height);
@@ -1643,6 +1799,7 @@ async function performAIAnalysis(isSupplement=false){
     for(let p=0;p<pixels.data.length;p+=4){pixels.data[p+3]=pixels.data[p];pixels.data[p]=255;pixels.data[p+1]=255;pixels.data[p+2]=255;}
     maskCtx.clearRect(0,0,maskCanvas.width,maskCanvas.height);maskCtx.putImageData(pixels,0,0);
     normalSourceCtx.clearRect(0,0,normalSourceCanvas.width,normalSourceCanvas.height);normalSourceCtx.drawImage(normalImage,0,0,normalSourceCanvas.width,normalSourceCanvas.height);aiNormalReady=true;rebuildAINormals(false);
+    detailNormalSourceCtx.clearRect(0,0,detailNormalSourceCanvas.width,detailNormalSourceCanvas.height);detailNormalSourceCtx.drawImage(detailNormalImage,0,0,detailNormalSourceCanvas.width,detailNormalSourceCanvas.height);detailNormalReady=true;rebuildDetailNormals(false);
     lineartCtx.clearRect(0,0,lineartCanvas.width,lineartCanvas.height);lineartCtx.drawImage(lineartImage,0,0,lineartCanvas.width,lineartCanvas.height);aiLineartReady=true;
     depthMapCtx.clearRect(0,0,depthMapCanvas.width,depthMapCanvas.height);depthMapCtx.drawImage(depthImage,0,0,depthMapCanvas.width,depthMapCanvas.height);
     rebuildDepthGeometry();
@@ -1665,8 +1822,7 @@ async function performAIAnalysis(isSupplement=false){
       : error.message;
     render();
   }
-  status.className='ai-status busy';
-  status.textContent=succeeded?'分析完成 · 正在安全释放显存…':'正在等待显存状态稳定…';
+  setAIStatus(succeeded?'分析完成 · 正在整理结果…':'正在结束本次分析…','busy');
   await new Promise(resolve=>setTimeout(resolve,GPU_COOLDOWN_MS));
   return {succeeded, finalStatus};
 }
@@ -1675,6 +1831,14 @@ async function runAIAnalysis(isSupplement=false){
   const status=document.querySelector('#aiStatus');
   if(localInferenceRunning)return;
   const execute=async()=>{
+    document.querySelector('#retryAnalysis').hidden=true;
+    const startedAt=Date.now();
+    const updateElapsed=()=>{
+      const seconds=Math.floor((Date.now()-startedAt)/1000);
+      document.querySelector('#analysisElapsed').textContent=`已用时 ${Math.floor(seconds/60)} 分 ${seconds%60} 秒 · ${seconds<180?'通常需要 1–3 分钟':'仍在处理中，复杂照片可能需要更久'}`;
+    };
+    updateElapsed();
+    const elapsedTimer=setInterval(updateElapsed,1000);
     localInferenceRunning=true;
     remoteInferenceOwner=null;
     clearTimeout(remoteInferenceTimer);
@@ -1687,6 +1851,7 @@ async function runAIAnalysis(isSupplement=false){
     }catch(error){
       result.finalStatus=error.message||result.finalStatus;
     }finally{
+      clearInterval(elapsedTimer);
       clearInterval(analysisHeartbeat);
       analysisHeartbeat=null;
       localInferenceRunning=false;
@@ -1695,6 +1860,7 @@ async function runAIAnalysis(isSupplement=false){
     }
     status.className=`ai-status ${result.succeeded?'success':'error'}`;
     status.textContent=result.finalStatus;
+    document.querySelector('#retryAnalysis').hidden=result.succeeded||!currentUploadFile||Boolean(pendingLocalRegion);
   };
   if(navigator.locks?.request){
     await navigator.locks.request(ANALYSIS_LOCK_NAME,{ifAvailable:true},async lock=>{
@@ -1710,7 +1876,7 @@ async function runAIAnalysis(isSupplement=false){
   }
 }
 [['gloss','gloss','glossValue',v=>(v<34?'粗糙 ':v<72?'半光 ':'镜面 ')+v+'%'],['strength','strength','strengthValue',v=>v+'%'],['reflections','reflections','reflectionsValue',v=>v+' 层'],['bounce','bounce','bounceValue',v=>v+'%'],['steps','steps','stepsValue',v=>v+' 阶']].forEach(([id,key,out,fmt])=>{
-  const el=document.querySelector('#'+id);el.addEventListener('input',()=>{state[key]=(key==='strength'||key==='bounce')?+el.value/100:+el.value;document.querySelector('#'+out).value=fmt(+el.value);if(key==='steps')updatePrimaryLegend();render();if(key==='gloss')renderDepthPreview();});
+  const el=document.querySelector('#'+id);el.addEventListener('input',()=>{state[key]=(key==='strength'||key==='bounce')?+el.value/100:+el.value;document.querySelector('#'+out).value=fmt(+el.value);syncAndroidValueControls(id);if(key==='steps')updatePrimaryLegend();render();if(key==='gloss')renderDepthPreview();});
 });
 
 function setCustomLighting(){
@@ -1721,12 +1887,14 @@ const fillLightControl=document.querySelector('#fillLight');
 fillLightControl.addEventListener('input',event=>{
   state.fillLight=+event.target.value/100;setCustomLighting();
   document.querySelector('#fillLightValue').value=event.target.value+'%';
+  syncAndroidValueControls('fillLight');
   render();renderDepthPreview();
 });
 const detailLightControl=document.querySelector('#detailLight');
 detailLightControl.addEventListener('input',event=>{
   state.detailLight=+event.target.value/100;setCustomLighting();
   document.querySelector('#detailLightValue').value=event.target.value+'%';
+  syncAndroidValueControls('detailLight');
   render();renderDepthPreview();
 });
 
@@ -1741,6 +1909,7 @@ const detailScaleControl=document.querySelector('#detailScale');
 detailScaleControl.addEventListener('input',event=>{
   state.detailScale=+event.target.value;
   document.querySelector('#detailScaleValue').value=state.detailScale+' px';
+  syncAndroidValueControls('detailScale');
   rebuildDetailNormals();if(aiNormalReady&&depthMapCanvas.width)rebuildDepthGeometry();renderDepthPreview();
 });
 
@@ -1748,7 +1917,18 @@ const detailStrengthControl=document.querySelector('#detailStrength');
 detailStrengthControl.addEventListener('input',event=>{
   state.detailStrength=+event.target.value/100;
   document.querySelector('#detailStrengthValue').value=event.target.value+'%';
+  syncAndroidValueControls('detailStrength');
   render();if(aiNormalReady&&depthMapCanvas.width)rebuildDepthGeometry();renderDepthPreview();
+});
+
+document.querySelectorAll('.android-value-options button[data-value]').forEach(button=>{
+  button.addEventListener('click',()=>{
+    const group=button.closest('.android-value-options');
+    const input=document.querySelector(`#${group.dataset.control}`);
+    if(!input||input.disabled)return;
+    input.value=button.dataset.value;
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  });
 });
 
 function canvasToBlob(source,type='image/png'){
@@ -1759,6 +1939,10 @@ function canvasToBlob(source,type='image/png'){
 }
 
 async function downloadBlob(blob,filename){
+  if(window.NMMMac){
+    await window.NMMMac.saveFile(await blobToDataURL(blob),filename);
+    return;
+  }
   if(isAndroidApp){
     await invokeAndroid('saveFile',await blobToDataURL(blob),filename,blob.type||'application/octet-stream');
     return;

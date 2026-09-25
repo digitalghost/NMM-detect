@@ -1,11 +1,15 @@
 package com.digitalghost.nmmprobe;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
@@ -35,6 +39,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -42,9 +47,19 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,16 +67,23 @@ import java.util.concurrent.Executors;
 /** Full offline landscape editor: Web UI plus isolated local ONNX inference. */
 public final class StudioActivity extends Activity {
     private static final int PICK_FILE = 4102;
+    private static final int CAPTURE_PHOTO = 4103;
     private static final String ORIGIN = "https://appassets.androidplatform.net";
     private static final String BRIDGE_INPUT = "studio-input.png";
     private static final String BRIDGE_OUTPUT = "studio-output.bin";
     private static final String RESULT_ROOT = "studio-results";
+    private static final int MAX_RESULT_RUNS = 12;
+    private static final long MAX_RESULT_BYTES = 512L * 1024L * 1024L;
+    private static final long MODEL_INSTALL_MARGIN = 512L * 1024L * 1024L;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
+    private File pendingCaptureFile;
+    private Uri pendingCaptureUri;
     private volatile Job currentJob;
     private boolean receiverRegistered;
+    private boolean modelsReady;
 
     private final BroadcastReceiver inferenceReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -93,7 +115,11 @@ public final class StudioActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setAllowFileAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setAllowContentAccess(true);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setSafeBrowsingEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setBuiltInZoomControls(false);
         settings.setDisplayZoomControls(false);
@@ -105,28 +131,165 @@ public final class StudioActivity extends Activity {
                                              FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = callback;
-                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                picker.addCategory(Intent.CATEGORY_OPENABLE);
-                picker.setType("image/*");
-                startActivityForResult(picker, PICK_FILE);
+                showPhotoSourceDialog();
                 return true;
             }
         });
         setContentView(webView);
         webView.loadUrl(ORIGIN + "/assets/index.html");
+        worker.execute(() -> cleanupResultCache(Set.of()));
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != PICK_FILE || fileCallback == null) return;
-        Uri[] result = resultCode == RESULT_OK && data != null && data.getData() != null
-                ? new Uri[]{data.getData()} : null;
-        fileCallback.onReceiveValue(result);
+        if (fileCallback == null) return;
+        if (requestCode == PICK_FILE) {
+            Uri selected = resultCode == RESULT_OK && data != null ? data.getData() : null;
+            finishFileSelection(selected);
+        } else if (requestCode == CAPTURE_PHOTO) {
+            Uri captured = null;
+            if (resultCode == RESULT_OK) {
+                if (pendingCaptureFile != null && pendingCaptureFile.length() == 0
+                        && data != null && data.getExtras() != null
+                        && data.getExtras().get("data") instanceof Bitmap) {
+                    try (OutputStream output = new FileOutputStream(pendingCaptureFile)) {
+                        ((Bitmap) data.getExtras().get("data"))
+                                .compress(Bitmap.CompressFormat.JPEG, 96, output);
+                    } catch (Exception ignored) {
+                        // The full-resolution EXTRA_OUTPUT path remains the primary result.
+                    }
+                }
+                if (pendingCaptureFile != null && pendingCaptureFile.length() > 0) {
+                    captured = pendingCaptureUri;
+                } else if (data != null) {
+                    captured = data.getData();
+                }
+            }
+            if (captured == null && pendingCaptureFile != null) pendingCaptureFile.delete();
+            if (pendingCaptureUri != null) {
+                revokeUriPermission(pendingCaptureUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            }
+            pendingCaptureFile = null;
+            pendingCaptureUri = null;
+            finishFileSelection(captured);
+        }
+    }
+
+    private void showPhotoSourceDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("导入模型照片")
+                .setItems(new String[]{"相机拍摄（可在相机内开启微距）", "从系统相册选择"},
+                        (dialog, which) -> {
+                            if (which == 0) openMacroCamera();
+                            else openPhotoLibrary();
+                        })
+                .setNegativeButton("取消", (dialog, which) -> finishFileSelection(null))
+                .setOnCancelListener(dialog -> finishFileSelection(null))
+                .show();
+    }
+
+    private void openPhotoLibrary() {
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        // Some document/cloud providers label .heif as generic binary.
+        picker.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "application/octet-stream"});
+        try {
+            startActivityForResult(picker, PICK_FILE);
+        } catch (Throwable error) {
+            toast("无法打开系统相册");
+            finishFileSelection(null);
+        }
+    }
+
+    private void openMacroCamera() {
+        try {
+            File directory = new File(getCacheDir(), "camera-captures");
+            if (!directory.isDirectory() && !directory.mkdirs()) {
+                throw new IllegalStateException("无法创建拍照缓存目录");
+            }
+            deleteOldCaptures(directory);
+            pendingCaptureFile = File.createTempFile("NMM_macro_", ".jpg", directory);
+            pendingCaptureUri = new Uri.Builder()
+                    .scheme("content")
+                    .authority(getPackageName() + ".capture")
+                    .appendPath(pendingCaptureFile.getName())
+                    .build();
+
+            Intent camera = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            camera.putExtra(MediaStore.EXTRA_OUTPUT, pendingCaptureUri);
+            camera.putExtra("android.intent.extras.CAMERA_FACING", 0);
+            camera.putExtra("android.intent.extra.USE_FRONT_CAMERA", false);
+            camera.setClipData(ClipData.newRawUri("NMM macro capture", pendingCaptureUri));
+            camera.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+            List<ResolveInfo> cameraApps = getPackageManager().queryIntentActivities(
+                    camera, PackageManager.MATCH_DEFAULT_ONLY);
+            if (cameraApps.isEmpty()) {
+                throw new IllegalStateException("没有找到可用的相机应用");
+            }
+            int uriFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+            for (ResolveInfo cameraApp : cameraApps) {
+                grantUriPermission(cameraApp.activityInfo.packageName, pendingCaptureUri, uriFlags);
+            }
+            startActivityForResult(camera, CAPTURE_PHOTO);
+        } catch (Throwable error) {
+            if (pendingCaptureUri != null) {
+                revokeUriPermission(pendingCaptureUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            }
+            if (pendingCaptureFile != null) pendingCaptureFile.delete();
+            pendingCaptureFile = null;
+            pendingCaptureUri = null;
+            toast("没有找到可用的相机应用");
+            finishFileSelection(null);
+        }
+    }
+
+    private static void deleteOldCaptures(File directory) {
+        File[] oldCaptures = directory.listFiles((parent, name) ->
+                name.startsWith("NMM_macro_") && name.endsWith(".jpg"));
+        if (oldCaptures == null) return;
+        for (File oldCapture : oldCaptures) oldCapture.delete();
+    }
+
+    private void finishFileSelection(Uri uri) {
+        if (fileCallback == null) return;
+        fileCallback.onReceiveValue(uri == null ? null : new Uri[]{uri});
         fileCallback = null;
     }
 
     private final class AndroidBridge {
+        @JavascriptInterface
+        public void decodeImport(String requestId, String dataUrl) {
+            worker.execute(() -> {
+                Bitmap bitmap = null;
+                try {
+                    if (dataUrl.length() > 90_000_000) throw new IllegalArgumentException("照片超过 64 MB");
+                    byte[] bytes = decodeDataUrl(dataUrl);
+                    if (bytes.length > 64 * 1024 * 1024) throw new IllegalArgumentException("照片超过 64 MB");
+                    bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes)),
+                            (decoder, info, ignored) -> {
+                                int w = info.getSize().getWidth(), h = info.getSize().getHeight();
+                                if ((long)w*h > 60_000_000) throw new IllegalArgumentException("照片超过 6000 万像素");
+                                decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                                decoder.setTargetColorSpace(android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB));
+                                float scale = Math.min(1f, 2048f / Math.max(w,h));
+                                decoder.setTargetSize(Math.max(1,Math.round(w*scale)),Math.max(1,Math.round(h*scale)));
+                            });
+                    java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream();
+                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) throw new IllegalStateException("PNG 转换失败");
+                    callback(requestId, true, new JSONObject().put("dataUrl", "data:image/png;base64,"+
+                            Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)));
+            } catch (Throwable error) {
+                callbackError(requestId, new IllegalArgumentException("无法解码或规范化此照片："+error.getMessage()));
+                } finally { if (bitmap != null) bitmap.recycle(); }
+            });
+        }
         @JavascriptInterface
         public void analyze(String requestId, String dataUrl, String fileName,
                             String regionsJson, String prompt) {
@@ -212,6 +375,7 @@ public final class StudioActivity extends Activity {
         try {
             ensureModels();
             File parent = resultDir(analysisId);
+            parent.setLastModified(System.currentTimeMillis());
             source = BitmapFactory.decodeFile(new File(parent, "source.png").getAbsolutePath());
             maskBitmap = BitmapFactory.decodeFile(new File(parent, "mask.png").getAbsolutePath());
             if (source == null || maskBitmap == null) throw new IllegalArgumentException("原始分析结果不存在，请重新导入照片");
@@ -240,6 +404,7 @@ public final class StudioActivity extends Activity {
             if (occupied < 64) throw new IllegalArgumentException("所选局部不包含已识别主体");
             Job job = new Job(Job.TYPE_REFINE, requestId, newId(), highSource);
             job.mask = mask;
+            job.sourceAnalysisId = analysisId;
             job.sourceBox = box;
             job.sourceSize = new int[]{box.width(), box.height()};
             currentJob = job;
@@ -325,9 +490,13 @@ public final class StudioActivity extends Activity {
 
     private void handleDepth(Job job, FloatImage output) throws Exception {
         progress("正在生成法线、微结构法线与纯线稿…");
+        if (output.camera == null) throw new IllegalStateException("深度缓存缺少相机内参，请重新分析照片");
+        float[] camera = output.camera.clone();
         float[] depth;
         if (job.type == Job.TYPE_ANALYZE) {
             Rect focus = job.focusBox;
+            camera[2] += focus.left;
+            camera[5] += focus.top;
             if (output.width != focus.width() || output.height != focus.height()) {
                 throw new IllegalStateException("主体聚焦深度尺寸错误");
             }
@@ -344,7 +513,7 @@ public final class StudioActivity extends Activity {
         }
         File directory = resultDir(job.id);
         if (!directory.exists() && !directory.mkdirs()) throw new IllegalStateException("无法建立分析缓存目录");
-        ArtifactGenerator.Result artifacts = ArtifactGenerator.generate(job.source, job.mask, depth);
+        ArtifactGenerator.Result artifacts = ArtifactGenerator.generate(job.source, job.mask, depth, camera);
         try {
             writeBitmap(job.source, new File(directory, "source.png"));
             writeBitmap(job.source, new File(directory, "crop.png"));
@@ -352,7 +521,16 @@ public final class StudioActivity extends Activity {
             writeBitmap(artifacts.depth, new File(directory, "depth.png"));
             writeBitmap(artifacts.normals, new File(directory, "normals.png"));
             writeBitmap(artifacts.detailNormals, new File(directory, "detail_normals.png"));
-            writeBitmap(artifacts.lineart, new File(directory, "lineart.png"));
+        writeBitmap(artifacts.lineart, new File(directory, "lineart.png"));
+            if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+                try (java.io.DataOutputStream raw = new java.io.DataOutputStream(new java.io.BufferedOutputStream(
+                        new java.io.FileOutputStream(new File(directory, "geometry-v2.bin"))))) {
+                    raw.writeInt(job.source.getWidth()); raw.writeInt(job.source.getHeight());
+                    for (float value : camera) raw.writeFloat(value);
+                    for (float value : depth) raw.writeFloat(value);
+                    for (float value : job.mask) raw.writeFloat(value);
+                }
+            }
         } finally { artifacts.recycle(); }
 
         JSONObject payload = new JSONObject();
@@ -378,6 +556,8 @@ public final class StudioActivity extends Activity {
             payload.put("refinement", refinement);
         }
         callback(job.requestId, true, payload);
+        cleanupResultCache(job.sourceAnalysisId == null
+                ? Set.of(job.id) : Set.of(job.id, job.sourceAnalysisId));
         recycleJob(job);
         currentJob = null;
     }
@@ -472,7 +652,11 @@ public final class StudioActivity extends Activity {
     private void finishError(String requestId, Throwable error) {
         Job job = currentJob;
         callbackError(requestId, error);
-        if (job != null) recycleJob(job);
+        if (job != null) {
+            File incomplete = resultDir(job.id);
+            if (incomplete.isDirectory()) deleteTree(incomplete);
+            recycleJob(job);
+        }
         currentJob = null;
     }
 
@@ -480,10 +664,142 @@ public final class StudioActivity extends Activity {
         if (job.source != null && !job.source.isRecycled()) job.source.recycle();
     }
 
-    private void ensureModels() {
-        for (String name : new String[]{"sam3-miniature-1008.onnx", "sam3-miniature-1008.onnx.data",
-                "da3-large-1008x756.onnx", "da3-large-1008x756.onnx.data"}) {
-            if (!new File(getFilesDir(), name).isFile()) throw new IllegalStateException("缺少本地模型文件：" + name);
+    private synchronized void ensureModels() throws Exception {
+        if (modelsReady) return;
+        String manifestText;
+        try (InputStream input = getAssets().open("models/manifest.tsv")) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) >= 0) bytes.write(buffer, 0, count);
+            manifestText = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+        }
+
+        Map<String, ModelAsset> assets = new LinkedHashMap<>();
+        for (String line : manifestText.split("\\R")) {
+            if (line.isBlank()) continue;
+            String[] fields = line.split("\\t");
+            if (fields.length != 3 || !fields[0].matches("[a-z0-9.-]+")) {
+                throw new IllegalStateException("内置模型清单损坏");
+            }
+            assets.put(fields[0], new ModelAsset(
+                    fields[0], Long.parseLong(fields[1]), fields[2]));
+        }
+        if (assets.size() != 4) throw new IllegalStateException("内置模型清单不完整");
+
+        File marker = new File(getFilesDir(), ".bundled-models.tsv");
+        if (marker.isFile()
+                && readUtf8(marker).equals(manifestText)
+                && assets.values().stream().allMatch(asset -> asset.matchesSize(getFilesDir()))) {
+            modelsReady = true;
+            return;
+        }
+
+        List<ModelAsset> pendingAssets = new ArrayList<>();
+        long requiredBytes = MODEL_INSTALL_MARGIN;
+        for (ModelAsset asset : assets.values()) {
+            File destination = new File(getFilesDir(), asset.name);
+            if (asset.matchesSize(getFilesDir()) && asset.sha256.equals(sha256(destination))) continue;
+            pendingAssets.add(asset);
+            requiredBytes = Math.addExact(requiredBytes, asset.size);
+        }
+
+        if (!pendingAssets.isEmpty() && getFilesDir().getUsableSpace() < requiredBytes) {
+            long requiredMegabytes = Math.max(1, (requiredBytes + 1024 * 1024 - 1) / (1024 * 1024));
+            throw new IllegalStateException("存储空间不足；安装内置本地模型至少还需要 "
+                    + requiredMegabytes + " MB 可用空间");
+        }
+
+        int index = 0;
+        for (ModelAsset asset : pendingAssets) {
+            index++;
+            File destination = new File(getFilesDir(), asset.name);
+            progress("正在释放内置 AI 模型 " + index + "/" + pendingAssets.size() + " · 请保持应用开启…");
+            installBundledModel(asset, destination);
+        }
+
+        File markerPart = new File(getFilesDir(), ".bundled-models.tsv.part");
+        writeUtf8(markerPart, manifestText);
+        moveAtomically(markerPart, marker);
+        modelsReady = true;
+    }
+
+    private void installBundledModel(ModelAsset asset, File destination) throws Exception {
+        File temporary = new File(getFilesDir(), asset.name + ".installing");
+        if (temporary.isFile() && !temporary.delete()) {
+            throw new IllegalStateException("无法清理未完成的模型安装：" + asset.name);
+        }
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        long written = 0;
+        try (InputStream input = new BufferedInputStream(
+                getAssets().open("models/" + asset.name,
+                        android.content.res.AssetManager.ACCESS_STREAMING),
+                4 * 1024 * 1024);
+             FileOutputStream fileOutput = new FileOutputStream(temporary);
+             BufferedOutputStream output = new BufferedOutputStream(fileOutput, 4 * 1024 * 1024)) {
+            byte[] buffer = new byte[4 * 1024 * 1024];
+            while (true) {
+                int count = input.read(buffer);
+                if (count < 0) break;
+                output.write(buffer, 0, count);
+                digest.update(buffer, 0, count);
+                written += count;
+            }
+            output.flush();
+            fileOutput.getFD().sync();
+        } catch (Exception error) {
+            temporary.delete();
+            throw error;
+        }
+        if (written != asset.size || !asset.sha256.equals(hex(digest.digest()))) {
+            temporary.delete();
+            throw new IllegalStateException("内置模型校验失败：" + asset.name);
+        }
+        moveAtomically(temporary, destination);
+    }
+
+    private static void moveAtomically(File source, File destination) throws Exception {
+        try {
+            Files.move(source.toPath(), destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new BufferedInputStream(new FileInputStream(file), 4 * 1024 * 1024)) {
+            byte[] buffer = new byte[4 * 1024 * 1024];
+            while (true) {
+                int count = input.read(buffer);
+                if (count < 0) break;
+                digest.update(buffer, 0, count);
+            }
+        }
+        return hex(digest.digest());
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) result.append(String.format(Locale.US, "%02x", value & 0xff));
+        return result.toString();
+    }
+
+    private static String readUtf8(File file) throws Exception {
+        try (InputStream input = new FileInputStream(file)) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[16 * 1024];
+            int count;
+            while ((count = input.read(buffer)) >= 0) bytes.write(buffer, 0, count);
+            return new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void writeUtf8(File file, String text) throws Exception {
+        try (FileOutputStream output = new FileOutputStream(file)) {
+            output.write(text.getBytes(StandardCharsets.UTF_8));
+            output.getFD().sync();
         }
     }
 
@@ -519,7 +835,11 @@ public final class StudioActivity extends Activity {
             }
             float[] values = new float[count];
             for (int i = 0; i < count; i++) values[i] = input.readFloat();
-            return new FloatImage(width, height, values);
+            float[] camera = null;
+            long extra = file.length() - 12L - count * 4L;
+            if (extra != 0 && extra != 36) throw new IllegalStateException("推理相机缓存损坏");
+            if (extra == 36) { camera = new float[9]; for (int i=0;i<9;i++) camera[i]=input.readFloat(); }
+            return new FloatImage(width, height, values, camera);
         }
     }
 
@@ -608,6 +928,40 @@ public final class StudioActivity extends Activity {
         return new File(new File(getCacheDir(), RESULT_ROOT), id);
     }
 
+    private void cleanupResultCache(Set<String> protectedIds) {
+        File root = new File(getCacheDir(), RESULT_ROOT);
+        File[] directories = root.listFiles(File::isDirectory);
+        if (directories == null) return;
+        Arrays.sort(directories, Comparator.comparingLong(File::lastModified).reversed());
+        long keptBytes = 0;
+        int keptRuns = 0;
+        for (File directory : directories) {
+            long size = directorySize(directory);
+            boolean keep = protectedIds.contains(directory.getName())
+                    || (keptRuns < MAX_RESULT_RUNS && keptBytes + size <= MAX_RESULT_BYTES);
+            if (keep) {
+                keptRuns++;
+                keptBytes += size;
+            } else {
+                deleteTree(directory);
+            }
+        }
+    }
+
+    private static long directorySize(File path) {
+        if (path.isFile()) return path.length();
+        long total = 0;
+        File[] children = path.listFiles();
+        if (children != null) for (File child : children) total += directorySize(child);
+        return total;
+    }
+
+    private static void deleteTree(File path) {
+        File[] children = path.listFiles();
+        if (children != null) for (File child : children) deleteTree(child);
+        if (!path.delete()) android.util.Log.w("NMMAndroid", "Unable to delete cache path: " + path);
+    }
+
     private void saveMedia(byte[] bytes, String fileName, String mimeType) throws Exception {
         try (InputStream input = new java.io.ByteArrayInputStream(bytes)) { saveMedia(input, fileName, mimeType); }
     }
@@ -642,6 +996,13 @@ public final class StudioActivity extends Activity {
 
     private final class LocalClient extends WebViewClient {
         @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            Uri uri = request.getUrl();
+            return !"https".equals(uri.getScheme())
+                    || !"appassets.androidplatform.net".equals(uri.getHost());
+        }
+
+        @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             Uri uri = request.getUrl();
             if (!"appassets.androidplatform.net".equals(uri.getHost())) return null;
@@ -649,6 +1010,7 @@ public final class StudioActivity extends Activity {
             try {
                 if (path != null && path.startsWith("/assets/")) {
                     String name = path.substring("/assets/".length());
+                    if (name.startsWith("models/")) return null;
                     return response(mime(name), getAssets().open(name));
                 }
                 if (path != null && path.startsWith("/generated/")) {
@@ -666,8 +1028,15 @@ public final class StudioActivity extends Activity {
 
         private WebResourceResponse response(String mime, InputStream stream) {
             WebResourceResponse response = new WebResourceResponse(mime, "UTF-8", stream);
-            response.setResponseHeaders(java.util.Map.of("Cache-Control", "no-store",
-                    "Access-Control-Allow-Origin", ORIGIN));
+            response.setResponseHeaders(java.util.Map.of(
+                    "Cache-Control", "no-store",
+                    "Access-Control-Allow-Origin", ORIGIN,
+                    "X-Content-Type-Options", "nosniff",
+                    "Content-Security-Policy",
+                    "default-src 'self'; img-src 'self' blob: data:; "
+                            + "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+                            + "connect-src 'self' data:; media-src 'self' blob:; "
+                            + "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
             return response;
         }
 
@@ -685,8 +1054,26 @@ public final class StudioActivity extends Activity {
         final int width;
         final int height;
         final float[] values;
-        FloatImage(int width, int height, float[] values) {
-            this.width = width; this.height = height; this.values = values;
+        final float[] camera;
+        FloatImage(int width, int height, float[] values, float[] camera) {
+            this.width = width; this.height = height; this.values = values; this.camera = camera;
+        }
+    }
+
+    private static final class ModelAsset {
+        final String name;
+        final long size;
+        final String sha256;
+
+        ModelAsset(String name, long size, String sha256) {
+            this.name = name;
+            this.size = size;
+            this.sha256 = sha256;
+        }
+
+        boolean matchesSize(File root) {
+            File file = new File(root, name);
+            return file.isFile() && file.length() == size;
         }
     }
 
@@ -705,6 +1092,7 @@ public final class StudioActivity extends Activity {
         Rect focusBox;
         Rect sourceBox;
         int[] sourceSize;
+        String sourceAnalysisId;
 
         Job(int type, String requestId, String id, Bitmap source) {
             this.type = type; this.requestId = requestId; this.id = id; this.source = source;
@@ -715,6 +1103,9 @@ public final class StudioActivity extends Activity {
     protected void onDestroy() {
         if (receiverRegistered) unregisterReceiver(inferenceReceiver);
         if (fileCallback != null) fileCallback.onReceiveValue(null);
+        if (pendingCaptureFile != null && pendingCaptureFile.length() == 0) {
+            pendingCaptureFile.delete();
+        }
         worker.shutdownNow();
         if (webView != null) {
             webView.removeJavascriptInterface("AndroidNMM");

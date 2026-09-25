@@ -1,0 +1,18 @@
+NMM Studio · Mac 离线版
+
+适用：Apple Silicon（M1 / M2 / M3 / M4 等），macOS 14 或更新系统。
+建议至少 16 GB 内存，首次启动可能需要稍等。
+
+安装：打开磁盘映像，将 NMM Studio 拖入 Applications（应用程序）。
+双击应用，选择模型照片，等待本地分析后调整灯光和材质。
+导出时会显示 Mac 保存对话框，可选择 PNG 或 MP4 的保存位置。
+模型与 Python 已包含在应用中，无需安装开发工具或联网下载模型。
+
+分析结果和诊断日志：
+~/Library/Application Support/NMM Studio/
+
+当前安装包为本机签名版本，尚未经过 Apple Developer ID 公证。
+在另一台 Mac 上如果系统阻止打开，请在系统设置 → 隐私与安全性中确认来源后允许打开。
+
+项目许可证见应用 Resources/studio/LICENSE；各模型许可证及说明见
+Resources/studio/.models/ 下的 LICENSE、README.md。

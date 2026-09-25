@@ -243,6 +243,7 @@ class LocalNMMPipeline:
         }
         source = np.asarray(image)
         normal_vectors = depth_to_normals(depth, mask, intrinsics)
+        detail_normal_vectors = depth_to_detail_normals(depth, mask, intrinsics)
         lineart = make_line_art(source, mask, normal_vectors, depth)
         final, normals, guide = render_nmm(
             lineart, mask, depth, intrinsics=intrinsics, normals=normal_vectors
@@ -258,6 +259,9 @@ class LocalNMMPipeline:
             "depth": Image.fromarray(depth_png),
             "lineart": Image.fromarray(lineart),
             "normals": Image.fromarray(normals),
+            "detail_normals": Image.fromarray(
+                np.clip((detail_normal_vectors + 1.0) * 127.5, 0, 255).astype(np.uint8)
+            ),
             "guide": Image.fromarray(guide),
             "result": Image.fromarray(final),
         }
