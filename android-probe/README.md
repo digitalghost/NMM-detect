@@ -1,5 +1,16 @@
 # NMM Android 全功能本地版
 
+## 安装已构建的 APK
+
+已经构建好的 APK 包含 SAM 3、DA3 和 ONNX Runtime。最终用户不需要通过 ADB 推送模型，也不需要在手机上运行下载脚本。APK 约 3.5 GB；安装包与首次释放的私有模型会同时占用空间，建议至少预留 8 GB，并使用 12 GB RAM 的 ARM64 设备。
+
+```bash
+# 从仓库根目录运行
+adb install -r android-probe/app/build/outputs/apk/debug/app-debug.apk
+```
+
+也可以把 APK 复制到手机并通过系统安装器打开。首次分析会校验并释放内置模型，请保持应用在前台。当前可直接安装的开发产物使用 Android 调试签名；公开发布需要配置 release keystore。
+
 ## 0.3.5 模型随 APK 分发与资源治理
 
 四个 SAM 3 / DA3 ONNX 文件现在会在构建时写入 APK 的 `assets/models/`，并生成包含文件大小和 SHA-256 的清单。首次分析时，应用会把模型流式释放到私有 `files/` 目录，校验后原子替换；升级时会复用哈希一致的已有文件，不再需要通过 ADB 手工推送模型。
@@ -73,7 +84,7 @@ Android UI 的源文件仍是仓库根目录的 `index.html`、`styles.css` 和 
 - `da3-large-1008x756.onnx`
 - `da3-large-1008x756.onnx.data`
 
-如果目录为空，先在仓库根目录准备桌面模型并导出 Android 图：
+如果目录为空，先按照仓库根目录 README 的“源码 / 本地 Web 快速开始”安装 Python 3.12 环境与固定版本 DA3，再准备桌面模型并导出 Android 图：
 
 ```bash
 .venv/bin/python scripts/download_models.py

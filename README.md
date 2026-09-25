@@ -81,7 +81,25 @@ flowchart LR
 
 CUDA/Linux 理论上可以通过 PyTorch 运行，但目前不是已完整验证的平台。纯 CPU 可以作为兼容回退，速度会明显降低。
 
-## 快速开始
+## 当前版本与平台状态
+
+当前版本为 `0.3.5`：
+
+| 形态 | 当前状态 | 模型交付方式 | 主要要求 |
+| --- | --- | --- | --- |
+| 源码 / 本地 Web | 可用，主要在 Apple Silicon 验证 | 首次运行前下载到 `.models/` | Python 3.12，建议 24 GB 统一内存 |
+| macOS 应用 | 可构建自包含 `.app` 和 DMG | 构建时把桌面模型放入应用包 | Apple Silicon、macOS 14+；当前为 ad-hoc 签名 |
+| Android 应用 | 完整离线版，可构建可安装 APK | 构建时把四个 ONNX 文件放入 APK | ARM64、Android 9+；建议 12 GB RAM、至少 8 GB 可用空间 |
+
+照片导入现在统一转换为最长边 `2048 px` 的 sRGB PNG，单文件限制为 64 MB、6000 万像素。桌面结果缓存限制为最近 20 次、最多 512 MB、最长 7 天；Android 缓存限制为最近 12 次或 512 MB。本地服务只公开界面文件与分析产物，并拒绝非本机 Host 和跨站 API 写请求。
+
+### 下载发行包还是下载源码
+
+- 如果发布页提供已经构建好的 **DMG 或 APK**，模型已经包含在安装包中。最终用户安装后无需再运行模型下载脚本。
+- 如果下载的是 **Git 仓库或 Source code 压缩包**，仓库不会包含模型权重。请按下面的源码流程下载模型并生成对应平台的安装包。
+- 模型由原始发布方单独授权。生成或分发包含模型的 DMG/APK 前，请确认使用场景符合 SAM 3 与 Depth Anything 3 的许可条款。
+
+## 源码 / 本地 Web 快速开始
 
 ### 1. 克隆仓库
 
@@ -151,6 +169,98 @@ MPLCONFIGDIR=/tmp/nmm-detect-matplotlib \
 ```text
 http://localhost:4173
 ```
+
+## 部署 macOS 应用
+
+macOS 构建会把 Python 3.12 运行时、依赖、前端和 `.models/` 中需要的权重放进应用包。收到已经构建好的 DMG 的用户无需单独下载模型。
+
+### 从源码生成 DMG
+
+先完成上面的环境安装、DA3 固定提交安装、macOS 兼容补丁和模型下载，然后安装 Xcode Command Line Tools 并构建：
+
+```bash
+xcode-select --install
+.venv/bin/python macos/build.py --dmg
+```
+
+构建脚本会在开始时检查以下文件，缺少任何一个都会直接停止并给出路径：
+
+- `.models/sam3/config.json`
+- `.models/sam3/model.safetensors`
+- `.models/da3-large-1.1/config.json`
+- `.models/da3-large-1.1/model.safetensors`
+
+产物位于：
+
+```text
+dist/macos/NMM Studio.app
+dist/macos/NMM-Studio-AppleSilicon.dmg
+dist/macos/SHA256SUMS.txt
+```
+
+当前应用使用 ad-hoc 签名，适合本机和开发测试。首次打开可在 Finder 中右键应用并选择“打开”。面向其他用户公开分发时，维护者仍需使用 Apple Developer ID 签名并完成 Apple 公证。
+
+更详细的运行行为与回归检查见 [`macos/README.md`](macos/README.md)。
+
+## 部署 Android APK
+
+Android 模型不会从网络下载到手机。构建电脑先把桌面模型导出为固定尺寸 ONNX 文件，Gradle 再把四个文件、大小和 SHA-256 清单一起写入 APK。手机首次分析时会把模型流式释放到应用私有目录并校验，之后可以完全离线运行。
+
+### 1. 准备桌面模型
+
+先完成上面的 Python 环境、DA3 固定提交安装与模型下载。如果构建电脑是 macOS，也需要先运行：
+
+```bash
+.venv/bin/python scripts/patch_da3_macos.py
+```
+
+### 2. 导出 Android ONNX 模型
+
+在仓库根目录运行：
+
+```bash
+.venv/bin/python scripts/export_sam3_android.py
+.venv/bin/python scripts/export_da3_android.py
+```
+
+完成后应存在：
+
+```text
+android-probe/models/sam3-miniature-1008.onnx
+android-probe/models/sam3-miniature-1008.onnx.data
+android-probe/models/da3-large-1008x756.onnx
+android-probe/models/da3-large-1008x756.onnx.data
+```
+
+这些文件合计约 3.4 GB，被 Git 忽略，但会作为 Gradle 构建输入。目录中用于实验的 Vulkan `.pte` 文件不会进入 APK。
+
+### 3. 构建 APK
+
+安装 JDK 17 和 Android SDK 34，设置 `JAVA_HOME` 与 `ANDROID_HOME`，然后运行：
+
+```bash
+(cd android-probe && ./gradlew assembleDebug)
+```
+
+Gradle 会检查四个模型、生成 SHA-256 清单，并固定使用 Maven Central 上的 ONNX Runtime Android `1.30.0`。缺少模型时构建会直接失败并显示缺失路径。
+
+可安装 APK 位于：
+
+```text
+android-probe/app/build/outputs/apk/debug/app-debug.apk
+```
+
+### 4. 安装到手机
+
+连接已启用 USB 调试的 ARM64 Android 设备：
+
+```bash
+adb install -r android-probe/app/build/outputs/apk/debug/app-debug.apk
+```
+
+也可以把 APK 复制到手机后通过系统安装器打开。APK 约 3.5 GB，安装 APK 与首次释放私有模型期间建议至少预留 8 GB 可用空间。首次分析会显示模型释放进度，请保持应用在前台。当前 `debug` APK 使用 Android 调试签名；公开分发需要配置正式 release keystore。
+
+更详细的设备基线、内存占用和回归方法见 [`android-probe/README.md`](android-probe/README.md)。
 
 ## 使用方法
 
@@ -231,17 +341,24 @@ NMM-detect/
 ├── styles.css                # Spectral Monolith UI
 ├── app.js                    # 交互、NMM 渲染、比较与导出
 ├── backend/
+│   ├── image_import.py       # HEIF/JPEG/PNG/WebP 安全规范化
 │   ├── server.py             # FastAPI、本地分析与 MP4 导出
 │   ├── pipeline.py           # SAM 3、DA3 与局部推理工作流
 │   └── nmm_shader.py         # 线稿、法线与光影辅助算法
+├── android-probe/             # ARM64 Android 离线应用与 ONNX 构建
+├── macos/                     # AppKit 应用、打包与 DMG 构建
 ├── scripts/
 │   ├── run_local.py          # 本地服务入口
 │   ├── download_models.py    # ModelScope 模型下载
+│   ├── export_sam3_android.py
+│   ├── export_da3_android.py
 │   ├── patch_da3_macos.py    # DA3 macOS 兼容补丁
 │   └── smoke_models.py       # 模型冒烟测试
+├── tests/                     # 导入、几何与跨端渲染验证
 ├── docs/
 │   └── depth-precision-roadmap.md
-└── pyproject.toml
+├── pyproject.toml
+└── uv.lock                    # Python 3.12 可复现依赖锁
 ```
 
 ## 本地 API
@@ -270,8 +387,11 @@ NMM-detect/
 
 ## 已知限制
 
-- 目前重点验证 Apple Silicon，其他平台需要更多测试与安装说明；
-- 首次安装和模型下载体积较大；
+- 桌面版目前重点验证 Apple Silicon；Windows、Linux 和 CUDA 仍需要更多测试与安装说明；
+- Android 目前只验证了 ARM64 高内存设备，峰值原生内存约 6–7 GB；低内存设备可能无法完成推理；
+- Android APK 约 3.5 GB，不适合常规应用商店的单包体积限制；当前更适合直接安装或内部发布；
+- macOS 包当前仅为 ad-hoc 签名；跨设备公开分发需要 Developer ID 签名和 Apple 公证；
+- 首次下载、模型导出和安装体积较大；
 - 透明件、镜面表面、极暗或过曝照片会降低分割与深度质量；
 - 单张照片无法可靠恢复模型背面或完全遮挡的结构；
 - 输出是涂装设计参考，不是物理测量结果，也不是完整 3D 扫描；
@@ -284,7 +404,7 @@ NMM-detect/
 - [ ] 16-bit 深度缓存，减少重复归一化损失
 - [ ] 多尺度法线融合，进一步增强铆钉和刻线
 - [ ] 参数预设的导入、导出与分享
-- [ ] 安卓端模型量化与完全离线可行性验证
+- [ ] Android 模型量化、分包与安装体积缩减
 - [ ] 更适合打印的涂装分区与编号参考页
 
 ## 开发与验证
@@ -350,6 +470,8 @@ Key features:
 - draggable lighting, stepped values and adjustable metal smoothness;
 - original/NMM split comparison and inspection lens;
 - annotated PNG boards and WeChat-friendly H.264 MP4 exports;
-- explicit light-source position and incident-light direction on exports.
+- explicit light-source position and incident-light direction on exports;
+- self-contained Apple Silicon macOS app packaging;
+- an ARM64 Android build that bundles verified ONNX model files inside the APK.
 
-The project is currently verified on Apple Silicon with Python 3.12 and is intended as a practical painting reference—not a physically exact scan or an automatic replacement for the painter.
+Prebuilt DMG/APK artifacts include their required model files. Source checkouts intentionally exclude model weights; builders must download the original SAM 3 and Depth Anything 3 models and follow the platform deployment sections above. The project is intended as a practical painting reference—not a physically exact scan or an automatic replacement for the painter.

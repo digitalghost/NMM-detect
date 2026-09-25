@@ -2,6 +2,27 @@
 
 原生 AppKit / WKWebView 窗口，内置独立 Python 3.12、当前工作环境的依赖和离线模型。适用于 Apple Silicon / macOS 14+（所附 PyTorch 的最低系统要求）。
 
+## 安装已构建的应用
+
+已经构建好的 `NMM-Studio-AppleSilicon.dmg` 包含 Python 运行时、应用依赖和推理模型。最终用户不需要再执行模型下载脚本；打开 DMG，把应用复制到“应用程序”即可。当前包使用 ad-hoc 签名，首次运行可在 Finder 中右键应用并选择“打开”。
+
+公开分发前仍需由发布者使用 Developer ID 签名并完成 Apple 公证。
+
+## 从源码准备依赖和模型
+
+在仓库根目录执行：
+
+```sh
+uv sync --python 3.12
+UV_CACHE_DIR=/tmp/nmm-detect-uv-cache \
+uv pip install --python .venv/bin/python --no-deps \
+'git+https://github.com/ByteDance-Seed/depth-anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4'
+.venv/bin/python scripts/patch_da3_macos.py
+.venv/bin/python scripts/download_models.py
+```
+
+模型下载到 `.models/`，不会提交到 Git。构建脚本会检查 SAM 3 与 DA3 的 `config.json` 和 `model.safetensors`，缺少文件时不会生成不完整应用。
+
 ## 构建
 
 在已配置 Web 版依赖、DA3 Mac 补丁和模型的项目根目录运行：
